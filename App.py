@@ -2,23 +2,37 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
-from yahoo_fin import stock_info as si
 
 st.set_page_config(page_title="סורק המניות המלא", layout="wide")
 
 st.title('🔍 סורק השוק המלא - 11 אינדיקטורים')
 
-# בחירת שוק
-market = st.selectbox("בחר שוק לסריקה:", ["NASDAQ (טכנולוגיה וצמיחה)", "S&P 500 (גדולות)", "מניות ה-DOW"])
+# פונקציות יציבות למשיכת רשימות מניות
+@st.cache_data
+def get_tickers(market):
+    try:
+        if market == "S&P 500 (גדולות)":
+            url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+            return pd.read_html(url)[0]['Symbol'].tolist()
+        elif market == "DOW JONES":
+            url = "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average"
+            return pd.read_html(url)[1]['Symbol'].tolist()
+        else: # NASDAQ - נשתמש ברשימה קבועה של הגדולות כדי למנוע קריסה
+            return ['AAPL', 'MSFT', 'AMZN', 'NVDA', 'GOOGL', 'GOOG', 'META', 'TSLA', 'AVGO', 'PEP', 'COST', 'ADBE', 'AZN', 'CSCO', 'AMD']
+    except:
+        return ['AAPL', 'TSLA', 'NVDA', 'AMD', 'MSFT', 'AMZN'] # רשימת גיבוי
+
+market_choice = st.selectbox("בחר שוק לסריקה:", ["S&P 500 (גדולות)", "DOW JONES", "NASDAQ (המובילות)"])
 
 def analyze_stock(symbol):
     try:
-        # משיכת נתונים
+        # החלפת נקודה במקף עבור סימולים כמו BRK.B
+        symbol = symbol.replace('.', '-')
         df = yf.download(symbol, period="150d", interval="1d", progress=False)
         if df.empty or len(df) < 50: return None
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
 
-        # 11 האינדיקטורים
+        # 11 אינדיקטורים
         df['RSI'] = ta.rsi(df['Close'], length=14)
         df['SMA50'] = ta.sma(df['Close'], length=50)
         df['SMA200'] = ta.sma(df['Close'], length=200)
@@ -35,7 +49,6 @@ def analyze_stock(symbol):
         last = df.iloc[-1]
         prev = df.iloc[-2]
         
-        # לוגיקת ניקוד
         score = 0
         if last['RSI'] < 35: score += 1
         if last['Close'] > last['SMA50']: score += 1
@@ -49,7 +62,7 @@ def analyze_stock(symbol):
         if last['RSI'] > prev['RSI']: score += 1
         if last['Volume'] > df['Volume'].tail(20).mean() * 1.3: score += 1
 
-        if score >= 6: # מציג רק מניות עם פוטנציאל
+        if score >= 6:
             return {
                 "סימול": symbol,
                 "מחיר": round(float(last['Close']), 2),
@@ -61,17 +74,14 @@ def analyze_stock(symbol):
         return None
 
 if st.button('🚀 הרץ סריקה חיה'):
-    with st.spinner('טוען רשימת מניות...'):
-        if "NASDAQ" in market: tickers = si.tickers_nasdaq()
-        elif "S&P" in market: tickers = si.tickers_sp500()
-        else: tickers = si.tickers_dow()
-    
-    # סורק 100 מניות ראשונות למהירות
+    tickers = get_tickers(market_choice)
+    # נסרוק עד 100 מניות ראשונות
     target = tickers[:100]
-    st.write(f"סורק {len(target)} מניות...")
     
-    results = []
+    st.write(f"סורק {len(target)} מניות מתוך {market_choice}...")
     prog = st.progress(0)
+    results = []
+    
     for i, t in enumerate(target):
         res = analyze_stock(t)
         if res: results.append(res)
