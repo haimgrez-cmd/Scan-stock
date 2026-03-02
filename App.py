@@ -2,29 +2,24 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
+from yahoo_fin import stock_info as si
 
-st.set_page_config(page_title="סורק שוק מקצועי", layout="wide")
+st.set_page_config(page_title="סורק שוק מלא", layout="wide")
 
-st.title('⚡ סורק שוק עוצמתי - 11 אינדיקטורים')
+st.title('🚀 סורק 3,000 מניות - מודל 11 האינדיקטורים')
 
-# רשימה מובנית של כ-150 מניות מובילות (למניעת שגיאות משיכה)
-STOCKS_TO_SCAN = [
-    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'BRK-B', 'UNH', 'JNJ',
-    'V', 'WMT', 'JPM', 'PG', 'MA', 'HD', 'CVX', 'LLY', 'ABBV', 'PFE', 'PEP', 'KO',
-    'BAC', 'COST', 'TMO', 'AVGO', 'CSCO', 'ACN', 'ABT', 'ADBE', 'MRK', 'DIS', 'DHR',
-    'LIN', 'NEE', 'ORCL', 'VZ', 'TXN', 'HON', 'PM', 'MS', 'RTX', 'AMV', 'IBM', 'QCOM',
-    'INTC', 'CAT', 'SBUX', 'LOW', 'AMD', 'SPGI', 'GS', 'PLD', 'NFLX', 'INTU', 'BLK',
-    'T', 'GE', 'ISRG', 'MDLZ', 'GILD', 'BKNG', 'AXP', 'SYK', 'CVS', 'AMT', 'ADI',
-    'DE', 'MO', 'TJX', 'MMC', 'LMT', 'CB', 'LRCX', 'ZTS', 'EL', 'CI', 'NOW', 'ADP',
-    'BDX', 'C', 'VRTX', 'SLB', 'EW', 'BSX', 'REGN', 'ITW', 'HCA', 'HUM', 'TGT', 'WM',
-    'DUK', 'PNC', 'FISV', 'MU', 'ATVI', 'ORLY', 'MCD', 'MMM', 'CL', 'SHW', 'CSX', 'NSC',
-    'F', 'GM', 'USB', 'ELV', 'PYPL', 'PANW', 'SNPS', 'CDNS', 'MCHP', 'ON', 'MDB', 'SQ',
-    'COIN', 'SHOP', 'NET', 'DDOG', 'U', 'DKNG', 'PLTR', 'SNOW', 'AFRM', 'RIVN', 'LCID'
-]
+@st.cache_data
+def get_huge_ticker_list():
+    # משיכת כל מניות הנאסד"ק (מעל 3,000 סימולים)
+    try:
+        return si.tickers_nasdaq()
+    except:
+        return ['AAPL', 'TSLA', 'NVDA', 'PLTR', 'AMD', 'MSFT', 'AMZN']
 
 def analyze_batch(tickers):
-    # הורדה קבוצתית מהירה מאוד
-    data = yf.download(tickers, period="150d", interval="1d", group_by='ticker', progress=False)
+    if not tickers: return []
+    # הורדה קבוצתית גדולה
+    data = yf.download(tickers, period="150d", interval="1d", group_by='ticker', progress=False, threads=True)
     results = []
     
     for ticker in tickers:
@@ -32,11 +27,12 @@ def analyze_batch(tickers):
             df = data[ticker].dropna()
             if len(df) < 50: continue
             
-            # ניקוי כותרות אם צריך
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
+            # סינון ראשוני: מחיר מעל 2$ ומחזור מסחר ממוצע מעל 200,000 מניות
+            last_price = float(df['Close'].iloc[-1])
+            avg_vol = df['Volume'].tail(20).mean()
+            if last_price < 2 or avg_vol < 200000: continue
 
-            # 11 האינדיקטורים המזוקקים
+            # חישוב 11 האינדיקטורים
             df['RSI'] = ta.rsi(df['Close'], length=14)
             df['SMA50'] = ta.sma(df['Close'], length=50)
             df['SMA200'] = ta.sma(df['Close'], length=200)
@@ -53,7 +49,7 @@ def analyze_batch(tickers):
             last = df.iloc[-1]
             prev = df.iloc[-2]
             
-            # לוגיקת הניקוד (0-11)
+            # לוגיקת הניקוד המזוקקת (0-11)
             score = 0
             if last['RSI'] < 35: score += 1
             if last['Close'] > last['SMA50']: score += 1
@@ -65,36 +61,39 @@ def analyze_batch(tickers):
             if last['Close'] > last['EMA20']: score += 1
             if last['MACD'] > prev['MACD']: score += 1
             if last['RSI'] > prev['RSI']: score += 1
-            if last['Volume'] > df['Volume'].tail(20).mean() * 1.3: score += 1
+            if last['Volume'] > avg_vol * 1.5: score += 1 # פריצה בווליום
 
             if score >= 7:
                 results.append({
                     "סימול": ticker,
-                    "מחיר": round(float(last['Close']), 2),
+                    "מחיר": round(last_price, 2),
                     "ציון (0-11)": score,
                     "RSI": round(float(last['RSI']), 1),
-                    "מצב": "💎 קנייה חזקה" if score >= 9 else "🚀 מעקב חיובי"
+                    "מחזור יומי": f"{int(last['Volume']):,}",
+                    "מצב": "💎 קנייה חזקה" if score >= 9 else "🚀 מומנטום חיובי"
                 })
         except:
             continue
     return results
 
-if st.button('🚀 הרץ סריקה רחבה על השוק'):
-    st.write(f"סורק {len(STOCKS_TO_SCAN)} מניות נבחרות (Large & Mid Caps)...")
-    progress_bar = st.progress(0)
+if st.button('🔥 הרץ סריקה על כל השוק (3,000+ מניות)'):
+    all_tickers = get_huge_ticker_list()
+    st.write(f"מתחיל סריקה על {len(all_tickers)} מניות. זה ייקח כ-2 דקות...")
     
-    # חלוקה לקבוצות למהירות שיא
+    progress_bar = st.progress(0)
     all_results = []
-    batch_size = 30
-    for i in range(0, len(STOCKS_TO_SCAN), batch_size):
-        batch = STOCKS_TO_SCAN[i : i + batch_size]
+    
+    # חלוקה לקבוצות של 100 לביצועים מקסימליים
+    batch_size = 100
+    for i in range(0, len(all_tickers), batch_size):
+        batch = all_tickers[i : i + batch_size]
         batch_res = analyze_batch(batch)
         all_results.extend(batch_res)
-        progress_bar.progress(min((i + batch_size) / len(STOCKS_TO_SCAN), 1.0))
+        progress_bar.progress(min((i + batch_size) / len(all_tickers), 1.0))
     
     if all_results:
         final_df = pd.DataFrame(all_results).sort_values(by="ציון (0-11)", ascending=False)
-        st.success(f"הסריקה הושלמה! נמצאו {len(all_results)} הזדמנויות.")
+        st.success(f"נמצאו {len(all_results)} מניות שעומדות בקריטריונים!")
         st.dataframe(final_df, use_container_width=True)
     else:
-        st.info("לא נמצאו מניות עם ציון גבוה כרגע. נסה שוב מאוחר יותר.")
+        st.info("לא נמצאו מניות עם ציון 7 ומעלה כרגע. השוק כנראה במצב המתנה.")
