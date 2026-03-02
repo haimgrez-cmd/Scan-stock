@@ -1,3 +1,7 @@
 streamlit
 yfinance
 pandas_ta
+yahoo_fin
+requests_htmlstreamlit
+yfinance
+pandas_ta
