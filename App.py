@@ -4,20 +4,21 @@ import pandas as pd
 import pandas_ta as ta
 from yahoo_fin import stock_info as si
 
-st.set_page_config(page_title="סורק השוק המלא", layout="wide")
+st.set_page_config(page_title="סורק המניות המלא", layout="wide")
 
-st.title('🔍 סורק מניות ארה"ב - המודל המזוקק')
+st.title('🔍 סורק השוק המלא - 11 אינדיקטורים')
 
-# בחירת שוק לסריקה
-market_choice = st.selectbox("בחר איזה שוק לסרוק:", ["NASDAQ (טכנולוגיה וצמיחה)", "S&P 500 (החברות הגדולות)", "DOW JONES"])
+# בחירת שוק
+market = st.selectbox("בחר שוק לסריקה:", ["NASDAQ (טכנולוגיה וצמיחה)", "S&P 500 (גדולות)", "מניות ה-DOW"])
 
 def analyze_stock(symbol):
     try:
+        # משיכת נתונים
         df = yf.download(symbol, period="150d", interval="1d", progress=False)
         if df.empty or len(df) < 50: return None
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
 
-        # 11 אינדיקטורים
+        # 11 האינדיקטורים
         df['RSI'] = ta.rsi(df['Close'], length=14)
         df['SMA50'] = ta.sma(df['Close'], length=50)
         df['SMA200'] = ta.sma(df['Close'], length=200)
@@ -34,7 +35,7 @@ def analyze_stock(symbol):
         last = df.iloc[-1]
         prev = df.iloc[-2]
         
-        # לוגיקת ניקוד 11 נקודות
+        # לוגיקת ניקוד
         score = 0
         if last['RSI'] < 35: score += 1
         if last['Close'] > last['SMA50']: score += 1
@@ -48,41 +49,35 @@ def analyze_stock(symbol):
         if last['RSI'] > prev['RSI']: score += 1
         if last['Volume'] > df['Volume'].tail(20).mean() * 1.3: score += 1
 
-        return {
-            "סימול": symbol,
-            "מחיר": round(float(last['Close']), 2),
-            "ציון (0-11)": score,
-            "RSI": round(float(last['RSI']), 1),
-            "מצב": "🔥 קנייה חזקה" if score >= 8 else "מעקב" if score >= 6 else "המתנה"
-        }
+        if score >= 6: # מציג רק מניות עם פוטנציאל
+            return {
+                "סימול": symbol,
+                "מחיר": round(float(last['Close']), 2),
+                "ציון (0-11)": score,
+                "RSI": round(float(last['RSI']), 1),
+                "מצב": "🚀 קנייה חזקה" if score >= 8 else "מעקב"
+            }
     except:
         return None
 
-if st.button('🚀 התחל סריקה חיה'):
-    with st.spinner('מושך רשימת מניות מהשוק...'):
-        if market_choice == "NASDAQ (טכנולוגיה וצמיחה)":
-            tickers = si.tickers_nasdaq()
-        elif market_choice == "S&P 500 (החברות הגדולות)":
-            tickers = si.tickers_sp500()
-        else:
-            tickers = si.tickers_dow()
-
-    # נסרוק את 150 המניות הראשונות ברשימה כדי לשמור על מהירות
-    # אפשר להגדיל את המספר הזה בזהירות
-    target_tickers = tickers[:150]
+if st.button('🚀 הרץ סריקה חיה'):
+    with st.spinner('טוען רשימת מניות...'):
+        if "NASDAQ" in market: tickers = si.tickers_nasdaq()
+        elif "S&P" in market: tickers = si.tickers_sp500()
+        else: tickers = si.tickers_dow()
     
-    st.write(f"סורק {len(target_tickers)} מניות מתוך רשימת {market_choice}...")
-    progress_bar = st.progress(0)
+    # סורק 100 מניות ראשונות למהירות
+    target = tickers[:100]
+    st.write(f"סורק {len(target)} מניות...")
+    
     results = []
-    
-    for i, t in enumerate(target_tickers):
+    prog = st.progress(0)
+    for i, t in enumerate(target):
         res = analyze_stock(t)
-        if res and res['ציון (0-11)'] >= 6: # מציג רק תוצאות מעניינות
-            results.append(res)
-        progress_bar.progress((i + 1) / len(target_tickers))
+        if res: results.append(res)
+        prog.progress((i + 1) / len(target))
         
     if results:
-        df_res = pd.DataFrame(results).sort_values(by="ציון (0-11)", ascending=False)
-        st.table(df_res)
+        st.table(pd.DataFrame(results).sort_values(by="ציון (0-11)", ascending=False))
     else:
-        st.info("לא נמצאו מניות שעומדות בקריטריונים כרגע.")
+        st.warning("לא נמצאו הזדמנויות כרגע.")
