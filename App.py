@@ -101,6 +101,7 @@ def compute_scores(close: pd.DataFrame, volume: pd.DataFrame) -> pd.DataFrame:
 def run_backtest(
     close: pd.DataFrame,
     scores: pd.DataFrame,
+    spy: pd.Series,
     start_date: str,
     min_score: int,
     top_n: int,
@@ -123,12 +124,8 @@ def run_backtest(
         exit_date  = trading_days[x_idx]
 
         # ─── כלל המזומן: אם SPY מתחת ל-SMA200 — יוצאים לחלוטין ──────
-        spy_close  = close["SPY"] if "SPY" in close.columns else None
-        spy_sma200 = spy_close.rolling(200).mean() if spy_close is not None else None
-        in_market  = (
-            spy_close is not None and
-            spy_close.loc[entry_date] > spy_sma200.loc[entry_date]
-        )
+        spy_sma200 = spy.rolling(200).mean()
+        in_market  = spy.loc[entry_date] > spy_sma200.loc[entry_date]
 
         day_scores = scores.loc[entry_date].dropna()
         qualified  = day_scores[day_scores >= min_score]
@@ -202,7 +199,7 @@ if st.button("▶️ הרץ Backtest", type="primary"):
     # 3. Backtest
     with st.spinner("מריץ Walk-Forward..."):
         portfolio, holdings_log = run_backtest(
-            close[score_tickers], scores, BACKTEST_START, min_score_in, top_n_in
+            close[score_tickers], scores, close["SPY"], BACKTEST_START, min_score_in, top_n_in
         )
 
     # ─── בנצ'מרק SPY ──────────────────────────────────────────────────────
