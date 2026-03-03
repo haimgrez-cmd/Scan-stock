@@ -122,15 +122,24 @@ def run_backtest(
         entry_date = trading_days[e_idx]
         exit_date  = trading_days[x_idx]
 
+        # ─── כלל המזומן: אם SPY מתחת ל-SMA200 — יוצאים לחלוטין ──────
+        spy_close  = close["SPY"] if "SPY" in close.columns else None
+        spy_sma200 = spy_close.rolling(200).mean() if spy_close is not None else None
+        in_market  = (
+            spy_close is not None and
+            spy_close.loc[entry_date] > spy_sma200.loc[entry_date]
+        )
+
         day_scores = scores.loc[entry_date].dropna()
         qualified  = day_scores[day_scores >= min_score]
 
-        if qualified.empty:
+        if qualified.empty or not in_market:
             port_values.append(port_values[-1])
             dates_out.append(exit_date)
+            reason = "📵 SPY מתחת SMA200 — מזומן" if not in_market else "—  (כסף מזומן)"
             log_rows.append({
                 "חודש": entry_date.strftime("%Y-%m"),
-                "מניות שנבחרו": "—  (כסף מזומן)",
+                "מניות שנבחרו": reason,
                 "מספר": 0,
                 "תשואה חודשית %": 0.0,
             })
