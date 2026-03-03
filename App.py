@@ -208,10 +208,7 @@ if st.button("🔥 הרץ סריקה על כל השוק (3,000+ מניות)"):
                    (df_final["מצב"].isin(status_filter))
         filtered = df_final[mask]
 
-        st.dataframe(
-            filtered.style.background_gradient(subset=["ציון (0-11)"], cmap="RdYlGn"),
-            use_container_width=True,
-        )
+        st.dataframe(filtered, use_container_width=True)
 
         csv = filtered.to_csv(index=False).encode("utf-8-sig")
         st.download_button("📥 ייצא ל-CSV", csv, "תוצאות_סריקה.csv", "text/csv")
