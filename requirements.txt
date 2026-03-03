@@ -1,5 +1,7 @@
 streamlit
 yfinance
+pandas
+numpy
+plotly
 pandas_ta
 yahoo_fin
-requests-html
