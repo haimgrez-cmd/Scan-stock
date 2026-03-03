@@ -1,216 +1,263 @@
-import time
-import logging
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
-from yahoo_fin import stock_info as si
+import numpy as np
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
 
-logging.basicConfig(level=logging.WARNING, format="%(levelname)s | %(message)s")
-logger = logging.getLogger(__name__)
-
-st.set_page_config(page_title="סורק שוק מלא", layout="wide")
-st.title("🚀 סורק 3,000 מניות - מודל 11 האינדיקטורים")
+st.set_page_config(page_title="Momentum Backtest", layout="wide")
+st.title("📊 Backtest מומנטום - Walk-Forward 10 שנים vs S&P 500")
+st.caption("יקום: S&P 500 | איזון מחדש: חודשי | בנצ'מרק: SPY")
 
 # ─── קבועים ────────────────────────────────────────────────────────────────
-MIN_PRICE        = 2.0
-MIN_AVG_VOL      = 200_000
-MIN_SCORE        = 7
-BATCH_SIZE       = 100
-SLEEP_BETWEEN    = 1.0   # שניות בין batches למניעת חסימה
-DATA_PERIOD      = "300d" # מספיק ל-SMA200 + מרווח
-STRONG_BUY_SCORE = 9
+LOOKBACK_YEARS = 10
+# מורידים 12 שנה כדי שיהיה warmup של שנתיים לחישוב SMA200 ו-ROC 12M
+DATA_START = (datetime.now() - timedelta(days=365 * 12)).strftime("%Y-%m-%d")
+DATA_END   = datetime.now().strftime("%Y-%m-%d")
+BACKTEST_START = (datetime.now() - timedelta(days=365 * LOOKBACK_YEARS)).strftime("%Y-%m-%d")
 
 
-# ─── רשימת טיקרים ──────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600)
-def get_ticker_list() -> list[str]:
+# ─── טעינת נתונים ──────────────────────────────────────────────────────────
+@st.cache_data(ttl=86400)
+def get_sp500_tickers() -> list[str]:
     try:
-        tickers = si.tickers_nasdaq()
-        logger.info(f"נטענו {len(tickers)} טיקרים מנאסד\"ק")
-        return tickers
-    except Exception as e:
-        logger.error(f"שגיאה בטעינת טיקרים: {e}")
-        return ["AAPL", "TSLA", "NVDA", "PLTR", "AMD", "MSFT", "AMZN"]
+        df = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+        return df["Symbol"].str.replace(".", "-", regex=False).tolist()
+    except Exception:
+        # fallback מינימלי אם ויקיפדיה לא זמינה
+        return [
+            "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","JPM","UNH",
+            "V","XOM","PG","MA","HD","CVX","MRK","ABBV","PEP","KO","BAC",
+            "AVGO","LLY","COST","TMO","CSCO","MCD","ACN","ABT","WMT","DHR"
+        ]
+
+@st.cache_data(ttl=86400, show_spinner="מוריד נתונים היסטוריים (עשוי לקחת כדקה)...")
+def download_all_data(tickers: list[str], start: str, end: str):
+    raw = yf.download(
+        tickers, start=start, end=end,
+        auto_adjust=True, progress=False, threads=True, group_by="ticker"
+    )
+    if isinstance(raw.columns, pd.MultiIndex):
+        close  = raw.xs("Close",  axis=1, level=1).ffill().dropna(how="all", axis=1)
+        volume = raw.xs("Volume", axis=1, level=1).ffill().dropna(how="all", axis=1)
+    else:
+        # טיקר בודד
+        close  = raw[["Close"]].ffill()
+        volume = raw[["Volume"]].ffill()
+    return close, volume
 
 
-# ─── ניתוח batch ────────────────────────────────────────────────────────────
-def analyze_batch(tickers: list[str]) -> list[dict]:
-    if not tickers:
-        return []
+# ─── חישוב אינדיקטורים ─────────────────────────────────────────────────────
+def rsi_series(close: pd.Series, length: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain  = delta.clip(lower=0).ewm(com=length - 1, adjust=False).mean()
+    loss  = (-delta.clip(upper=0)).ewm(com=length - 1, adjust=False).mean()
+    return 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
 
-    try:
-        raw = yf.download(
-            tickers,
-            period=DATA_PERIOD,
-            interval="1d",
-            group_by="ticker",
-            progress=False,
-            threads=True,
-            auto_adjust=True,
-        )
-    except Exception as e:
-        logger.error(f"שגיאה בהורדת נתונים: {e}")
-        return []
+@st.cache_data(ttl=86400, show_spinner="מחשב אינדיקטורים לכל המניות...")
+def compute_scores(close: pd.DataFrame, volume: pd.DataFrame) -> pd.DataFrame:
+    """
+    מחשב ציון מומנטום (0-8) לכל מניה בכל יום.
+    ללא ADX (קשה לוקטוריזציה יעילה) — שמרנו 8 קריטריונים.
+    """
+    scores = pd.DataFrame(0.0, index=close.index, columns=close.columns)
 
-    results = []
+    for ticker in close.columns:
+        c = close[ticker].dropna()
+        v = volume[ticker].reindex(c.index).fillna(0)
 
-    for ticker in tickers:
-        try:
-            # תמיכה ב-MultiIndex (מספר טיקרים) וב-flat DataFrame (טיקר בודד)
-            if isinstance(raw.columns, pd.MultiIndex):
-                if ticker not in raw.columns.get_level_values(0):
-                    continue
-                df = raw[ticker].dropna()
-            else:
-                df = raw.dropna()
-
-            if len(df) < 60:
-                continue
-
-            last_price = float(df["Close"].iloc[-1])
-            avg_vol    = float(df["Volume"].tail(20).mean())
-
-            if last_price < MIN_PRICE or avg_vol < MIN_AVG_VOL:
-                continue
-
-            # ─── חישוב אינדיקטורים ──────────────────────────────────────
-            df["RSI"]    = ta.rsi(df["Close"], length=14)
-            df["SMA50"]  = ta.sma(df["Close"], length=50)
-            df["SMA200"] = ta.sma(df["Close"], length=200)
-            df["EMA20"]  = ta.ema(df["Close"], length=20)
-
-            macd_df      = ta.macd(df["Close"])
-            df["MACD"]   = macd_df.iloc[:, 0]   # MACD line
-            df["MACD_S"] = macd_df.iloc[:, 1]   # Signal line
-
-            bb_df        = ta.bbands(df["Close"], length=20)
-            df["BBL"]    = bb_df.iloc[:, 0]
-            df["BBU"]    = bb_df.iloc[:, 2]
-
-            stoch_df     = ta.stoch(df["High"], df["Low"], df["Close"])
-            df["STOCHk"] = stoch_df.iloc[:, 0]
-
-            adx_df       = ta.adx(df["High"], df["Low"], df["Close"])
-            df["ADX"]    = adx_df.iloc[:, 0]
-
-            df.dropna(inplace=True)
-            if len(df) < 2:
-                continue
-
-            last = df.iloc[-1]
-            prev = df.iloc[-2]
-
-            # ─── לוגיקת ניקוד (0-11) ────────────────────────────────────
-            score = 0
-
-            # מומנטום / oversold
-            if last["RSI"] < 35:                          score += 1  # RSI נמוך – oversold
-            if last["RSI"] > prev["RSI"]:                 score += 1  # RSI עולה
-            if last["STOCHk"] < 25:                       score += 1  # סטוכסטיק oversold
-
-            # טרנד
-            if last["Close"] > last["SMA50"]:             score += 1  # מעל ממוצע 50
-            if last["Close"] > last["SMA200"]:            score += 1  # מעל ממוצע 200
-            if last["Close"] > last["EMA20"]:             score += 1  # מעל EMA 20
-
-            # MACD
-            if last["MACD"] > last["MACD_S"]:            score += 1  # MACD מעל signal
-            if last["MACD"] > prev["MACD"]:               score += 1  # MACD עולה
-
-            # ADX – עוצמת טרנד
-            if last["ADX"] > 20:                          score += 1  # טרנד חזק
-
-            # בולינגר – קרבה לרצועה תחתונה (ללא סתירה עם SMA50)
-            bb_range = last["BBU"] - last["BBL"]
-            bb_pos   = (last["Close"] - last["BBL"]) / bb_range if bb_range > 0 else 0.5
-            if bb_pos < 0.3:                              score += 1  # בשליש התחתון של הבולינגר
-
-            # פריצת ווליום
-            if last["Volume"] > avg_vol * 1.5:            score += 1  # ווליום חריג
-
-            if score < MIN_SCORE:
-                continue
-
-            pct_change = (last["Close"] - prev["Close"]) / prev["Close"] * 100
-
-            results.append({
-                "סימול":        ticker,
-                "מחיר":         round(last_price, 2),
-                "ציון (0-11)":  score,
-                "מצב":          "💎 קנייה חזקה" if score >= STRONG_BUY_SCORE else "🚀 מומנטום חיובי",
-                "RSI":          round(float(last["RSI"]), 1),
-                "MACD":         round(float(last["MACD"]), 3),
-                "ADX":          round(float(last["ADX"]), 1),
-                "% שינוי יומי": round(pct_change, 2),
-                "מחזור יומי":   int(last["Volume"]),
-            })
-
-        except Exception as e:
-            logger.warning(f"שגיאה בניתוח {ticker}: {e}")
+        if len(c) < 260:   # צריך לפחות שנה+ של נתונים
             continue
 
-    return results
+        sma50  = c.rolling(50).mean()
+        sma100 = c.rolling(100).mean()
+        sma200 = c.rolling(200).mean()
+        roc3   = c.pct_change(63)  * 100   # ~3 חודשים
+        roc6   = c.pct_change(126) * 100   # ~6 חודשים
+        roc12  = c.pct_change(252) * 100   # ~12 חודשים
+        vol20  = v.rolling(20).mean()
+        vol50  = v.rolling(50).mean()
+        rsi    = rsi_series(c, 14)
+
+        s = (
+            (c > sma50).astype(float)                              +  # מעל SMA50
+            (c > sma100).astype(float)                             +  # מעל SMA100
+            (c > sma200).astype(float)                             +  # מעל SMA200
+            ((sma50 > sma100) & (sma100 > sma200)).astype(float)  +  # ממוצעים מדורגים
+            (roc3  > 5).astype(float)                              +  # ROC 3M > 5%
+            (roc6  > 10).astype(float)                             +  # ROC 6M > 10%
+            (roc12 > 15).astype(float)                             +  # ROC 12M > 15%
+            (vol20 > vol50 * 1.1).astype(float)                      # ווליום תומך
+        )
+
+        s[rsi > 80] = 0   # פסילה: קנייה יתר קיצונית
+
+        scores[ticker] = s.reindex(close.index)
+
+    return scores
+
+
+# ─── Walk-Forward Backtest ──────────────────────────────────────────────────
+def run_backtest(
+    close: pd.DataFrame,
+    scores: pd.DataFrame,
+    start_date: str,
+    min_score: int,
+    top_n: int,
+) -> tuple[pd.Series, pd.DataFrame]:
+
+    trading_days = close.index
+    month_ends   = pd.date_range(start_date, close.index[-1], freq="ME")
+
+    port_values  = [1.0]
+    dates_out    = [trading_days[trading_days.searchsorted(month_ends[0])]]
+    log_rows     = []
+
+    for i in range(len(month_ends) - 1):
+        e_idx = trading_days.searchsorted(month_ends[i],     side="left")
+        x_idx = trading_days.searchsorted(month_ends[i + 1], side="left")
+        if e_idx >= len(trading_days) or x_idx >= len(trading_days):
+            continue
+
+        entry_date = trading_days[e_idx]
+        exit_date  = trading_days[x_idx]
+
+        day_scores = scores.loc[entry_date].dropna()
+        qualified  = day_scores[day_scores >= min_score]
+
+        if qualified.empty:
+            port_values.append(port_values[-1])
+            dates_out.append(exit_date)
+            log_rows.append({
+                "חודש": entry_date.strftime("%Y-%m"),
+                "מניות שנבחרו": "—  (כסף מזומן)",
+                "מספר": 0,
+                "תשואה חודשית %": 0.0,
+            })
+            continue
+
+        top = qualified.nlargest(top_n).index
+        ep  = close.loc[entry_date, top].dropna()
+        xp  = close.loc[exit_date,  ep.index].dropna()
+        common = ep.index.intersection(xp.index)
+
+        if common.empty:
+            port_values.append(port_values[-1])
+            dates_out.append(exit_date)
+            continue
+
+        monthly_ret = ((xp[common] / ep[common]) - 1).mean()
+        port_values.append(port_values[-1] * (1 + monthly_ret))
+        dates_out.append(exit_date)
+
+        log_rows.append({
+            "חודש": entry_date.strftime("%Y-%m"),
+            "מניות שנבחרו": "  |  ".join(common[:8].tolist()) + ("  ..." if len(common) > 8 else ""),
+            "מספר": len(common),
+            "תשואה חודשית %": round(monthly_ret * 100, 2),
+        })
+
+    return pd.Series(port_values, index=dates_out), pd.DataFrame(log_rows)
 
 
 # ─── ממשק משתמש ─────────────────────────────────────────────────────────────
-col1, col2, col3 = st.columns(3)
-col1.metric("ציון מינימלי", MIN_SCORE)
-col2.metric("מחיר מינימלי", f"${MIN_PRICE}")
-col3.metric("מחזור מינימלי", f"{MIN_AVG_VOL:,}")
+with st.expander("ℹ️ איך ה-Backtest עובד?"):
+    st.markdown("""
+    **Walk-Forward Methodology:**
+    בכל סוף חודש לאורך 10 השנים האחרונות:
+    1. מחשבים ציון מומנטום לכל מניה ב-S&P 500 **רק על נתונים שהיו זמינים באותו יום** (ללא look-ahead bias)
+    2. בוחרים את N המניות עם הציון הגבוה ביותר
+    3. "מחזיקים" אותן חודש בחלוקה שווה
+    4. משווים לתשואת SPY באותה תקופה
+    
+    **הערה:** לא כולל עמלות מסחר, מיסים, או השפעת מחיר (slippage)
+    """)
 
-st.divider()
+c1, c2 = st.columns(2)
+top_n_in     = c1.slider("מספר מניות להחזיק בכל חודש", 5, 50, 20)
+min_score_in = c2.slider("ציון מינימלי (מתוך 8)", 4, 8, 6)
 
-if st.button("🔥 הרץ סריקה על כל השוק (3,000+ מניות)"):
-    all_tickers = get_ticker_list()
-    st.info(f"מתחיל סריקה על {len(all_tickers)} מניות. זה ייקח כ-2 דקות...")
+if st.button("▶️ הרץ Backtest", type="primary"):
 
-    progress_bar  = st.progress(0)
-    status_text   = st.empty()
-    all_results   = []
-    total_batches = (len(all_tickers) + BATCH_SIZE - 1) // BATCH_SIZE
+    # 1. טעינה
+    with st.spinner("טוען רשימת S&P 500..."):
+        tickers = get_sp500_tickers()
 
-    for i, start in enumerate(range(0, len(all_tickers), BATCH_SIZE)):
-        batch       = all_tickers[start : start + BATCH_SIZE]
-        batch_res   = analyze_batch(batch)
-        all_results.extend(batch_res)
+    close, volume = download_all_data(["SPY"] + tickers, DATA_START, DATA_END)
+    st.success(f"נטענו {close.shape[1]-1} מניות + SPY | {close.shape[0]:,} ימי מסחר")
 
-        progress    = (i + 1) / total_batches
-        progress_bar.progress(progress)
-        status_text.text(
-            f"batch {i+1}/{total_batches} | נמצאו עד כה: {len(all_results)} מניות"
+    # 2. ציונים
+    score_tickers = [t for t in close.columns if t != "SPY"]
+    scores = compute_scores(close[score_tickers], volume[score_tickers])
+
+    # 3. Backtest
+    with st.spinner("מריץ Walk-Forward..."):
+        portfolio, holdings_log = run_backtest(
+            close[score_tickers], scores, BACKTEST_START, min_score_in, top_n_in
         )
 
-        if i < total_batches - 1:
-            time.sleep(SLEEP_BETWEEN)
+    # ─── בנצ'מרק SPY ──────────────────────────────────────────────────────
+    spy       = close["SPY"].dropna()
+    spy_bt    = spy[spy.index >= BACKTEST_START]
+    spy_norm  = spy_bt / spy_bt.iloc[0]
 
-    status_text.empty()
+    # ─── מדדי ביצוע ───────────────────────────────────────────────────────
+    port_ret   = portfolio.iloc[-1] - 1
+    spy_ret    = spy_norm.iloc[-1] - 1
+    port_mon   = portfolio.pct_change().dropna()
+    spy_mon    = spy_norm.pct_change().dropna()
 
-    if all_results:
-        df_final = (
-            pd.DataFrame(all_results)
-            .sort_values("ציון (0-11)", ascending=False)
-            .reset_index(drop=True)
-        )
+    # Maximum Drawdown
+    roll_max   = portfolio.cummax()
+    drawdown   = (portfolio / roll_max) - 1
+    max_dd     = drawdown.min()
 
-        st.success(f"✅ נמצאו {len(df_final)} מניות שעומדות בקריטריונים!")
+    # Sharpe (שנתי, risk-free ≈ 0 לפשטות)
+    sharpe = (port_mon.mean() / port_mon.std()) * np.sqrt(12) if port_mon.std() > 0 else 0
 
-        # ─── סינון אינטראקטיבי ──────────────────────────────────────────
-        st.subheader("סינון תוצאות")
-        fc1, fc2 = st.columns(2)
-        min_score_filter = fc1.slider("ציון מינימלי", MIN_SCORE, 11, MIN_SCORE)
-        status_filter    = fc2.multiselect(
-            "מצב", ["💎 קנייה חזקה", "🚀 מומנטום חיובי"],
-            default=["💎 קנייה חזקה", "🚀 מומנטום חיובי"]
-        )
+    # ─── גרף ──────────────────────────────────────────────────────────────
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=portfolio.index, y=portfolio.values,
+        name="אסטרטגיית מומנטום",
+        line=dict(color="#00C851", width=2.5)
+    ))
+    fig.add_trace(go.Scatter(
+        x=spy_norm.index, y=spy_norm.values,
+        name="S&P 500 (SPY)",
+        line=dict(color="#2196F3", width=2, dash="dot")
+    ))
+    fig.add_hrect(y0=0, y1=1, fillcolor="red", opacity=0.03, line_width=0)
+    fig.update_layout(
+        title=f"תשואה מצטברת ({LOOKBACK_YEARS} שנים)",
+        xaxis_title="תאריך",
+        yaxis_title="ערך (1.0 = נקודת פתיחה)",
+        yaxis_tickformat=".0%",
+        hovermode="x unified",
+        template="plotly_dark",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        height=480,
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
-        mask     = (df_final["ציון (0-11)"] >= min_score_filter) & \
-                   (df_final["מצב"].isin(status_filter))
-        filtered = df_final[mask]
+    # ─── כרטיסי מדדים ────────────────────────────────────────────────────
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("תשואה כוללת - מומנטום",  f"{port_ret*100:.1f}%",
+              delta=f"{(port_ret - spy_ret)*100:.1f}% vs SPY")
+    m2.metric("תשואה כוללת - SPY",       f"{spy_ret*100:.1f}%")
+    m3.metric("תשואה חודשית ממוצעת",    f"{port_mon.mean()*100:.2f}%")
+    m4.metric("Sharpe Ratio (שנתי)",     f"{sharpe:.2f}")
+    m5.metric("Maximum Drawdown",        f"{max_dd*100:.1f}%")
 
-        st.dataframe(filtered, use_container_width=True)
+    # ─── לוג חודשי ────────────────────────────────────────────────────────
+    st.divider()
+    with st.expander("📋 לוג חודשי מלא"):
+        log_df = pd.DataFrame(holdings_log)
+        # צביעת שורות לפי תשואה
+        pos_months = (log_df["תשואה חודשית %"] > 0).sum()
+        st.caption(f"חודשים חיוביים: {pos_months}/{len(log_df)}  |  "
+                   f"תשואה חודשית ממוצעת: {log_df['תשואה חודשית %'].mean():.2f}%")
+        st.dataframe(log_df, use_container_width=True)
 
-        csv = filtered.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("📥 ייצא ל-CSV", csv, "תוצאות_סריקה.csv", "text/csv")
-    else:
-        st.warning("לא נמצאו מניות עם ציון 7 ומעלה כרגע. השוק כנראה במצב המתנה.")
+    csv = holdings_log.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("📥 ייצא לוג ל-CSV", csv, "momentum_backtest.csv", "text/csv")
