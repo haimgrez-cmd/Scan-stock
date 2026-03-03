@@ -84,7 +84,7 @@ def score_ticker(ticker: str, df: pd.DataFrame) -> dict | None:
     vol50  = float(v.rolling(50).mean().iloc[-1])
     rsi    = calc_rsi(c)
 
-    if rsi > 80:
+    if rsi > 75:
         return None
 
     score = 0
@@ -92,12 +92,12 @@ def score_ticker(ticker: str, df: pd.DataFrame) -> dict | None:
     if last_price > sma100:     score += 1
     if last_price > sma200:     score += 1
     if sma50 > sma100 > sma200: score += 1
-    if roc3  > 5:               score += 1
-    if roc6  > 10:              score += 1
-    if roc12 > 15:              score += 1
-    if vol20 > vol50 * 1.1:     score += 1
+    if roc3  > 8:               score += 1  # הוחמר מ-5
+    if roc6  > 20:              score += 1  # הוחמר מ-10
+    if roc12 > 30:              score += 1  # הוחמר מ-15
+    if vol20 > vol50 * 1.2:     score += 1  # הוחמר מ-1.1
 
-    if score < 6:
+    if score < 7:
         return None
 
     return {
@@ -139,7 +139,7 @@ def analyze_batch(tickers: list[str]) -> list[dict]:
 
 
 # ─── ממשק ──────────────────────────────────────────────────────────────────
-min_score_ui = st.slider("ציון מינימלי (מתוך 8)", 4, 8, 6)
+min_score_ui = st.slider("ציון מינימלי (מתוך 8)", 4, 8, 7)
 st.divider()
 
 if st.button("🔍 סרוק עכשיו", type="primary"):
