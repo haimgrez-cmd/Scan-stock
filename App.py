@@ -108,7 +108,7 @@ def run_backtest(
 ) -> tuple[pd.Series, pd.DataFrame]:
 
     trading_days = close.index
-    month_ends   = pd.date_range(start_date, close.index[-1], freq="ME")
+    month_ends   = pd.date_range(start_date, close.index[-1], freq="QE")
 
     port_values  = [1.0]
     dates_out    = [trading_days[trading_days.searchsorted(month_ends[0])]]
@@ -123,20 +123,16 @@ def run_backtest(
         entry_date = trading_days[e_idx]
         exit_date  = trading_days[x_idx]
 
-        # ─── כלל המזומן: אם SPY מתחת ל-SMA200 — יוצאים לחלוטין ──────
-        spy_sma200 = spy.rolling(200).mean()
-        in_market  = spy.loc[entry_date] > spy_sma200.loc[entry_date]
-
+        # ─── בדיקת ציונים ───────────────────────────────────────────────
         day_scores = scores.loc[entry_date].dropna()
         qualified  = day_scores[day_scores >= min_score]
 
-        if qualified.empty or not in_market:
+        if qualified.empty:
             port_values.append(port_values[-1])
             dates_out.append(exit_date)
-            reason = "📵 SPY מתחת SMA200 — מזומן" if not in_market else "—  (כסף מזומן)"
             log_rows.append({
                 "חודש": entry_date.strftime("%Y-%m"),
-                "מניות שנבחרו": reason,
+                "מניות שנבחרו": "— (כסף מזומן)",
                 "מספר": 0,
                 "תשואה חודשית %": 0.0,
             })
