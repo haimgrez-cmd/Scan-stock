@@ -24,13 +24,42 @@ SLEEP       = 1.0
 # ─── טיקרים ────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400)
 def get_tickers() -> list[str]:
+    # ניסיון 1: Wikipedia
     try:
         df = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-        return df["Symbol"].str.replace(".", "-", regex=False).tolist()
+        tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
+        if len(tickers) > 100:
+            return tickers
     except Exception as e:
-        logger.error(e)
-        return ["AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA",
-                "JPM","V","XOM","PG","MA","HD","CVX","MRK"]
+        logger.warning(f"Wikipedia נכשל: {e}")
+
+    # ניסיון 2: GitHub (מתעדכן אוטומטית)
+    try:
+        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+        df  = pd.read_csv(url)
+        tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
+        if len(tickers) > 100:
+            return tickers
+    except Exception as e:
+        logger.warning(f"GitHub נכשל: {e}")
+
+    # ניסיון 3: SPY holdings דרך yfinance
+    try:
+        spy   = yf.Ticker("SPY")
+        holds = spy.funds_data.top_holdings
+        if holds is not None and len(holds) > 20:
+            return holds.index.tolist()
+    except Exception as e:
+        logger.warning(f"SPY holdings נכשל: {e}")
+
+    # Fallback: 50 מניות גדולות
+    return [
+        "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","JPM","V","XOM",
+        "PG","MA","HD","CVX","MRK","ABBV","PEP","KO","BAC","AVGO","LLY",
+        "COST","TMO","CSCO","MCD","ACN","ABT","WMT","DHR","NEE","TXN","UNH",
+        "CRM","QCOM","HON","IBM","INTC","AMD","GE","CAT","BA","MMM","GS",
+        "MS","BLK","SPGI","AXP","ISRG","SYK","ZTS"
+    ]
 
 
 # ─── RSI ───────────────────────────────────────────────────────────────────
