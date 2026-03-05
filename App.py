@@ -1,22 +1,18 @@
-import time
-import logging
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
 
-logging.basicConfig(level=logging.WARNING)
-logger = logging.getLogger(__name__)
+st.set_page_config(page_title="Momentum Backtest 20Y", layout="wide")
+st.title("📊 Backtest מומנטום — 20 שנה | רבעוני | Top 3-5 מניות")
+st.caption("יקום: S&P 500 | איזון: סוף כל רבעון | בנצ'מרק: SPY")
 
-st.set_page_config(page_title="סורק מומנטום", layout="wide")
-st.title("📈 סורק מומנטום רבעוני — S&P 500")
-st.caption(f"עדכון: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-
-DATA_PERIOD = "380d"
-BATCH_SIZE  = 50
-SLEEP       = 1.0
-MIN_SCORE   = 7
+# ─── קבועים ────────────────────────────────────────────────────────────────
+DATA_START      = "2003-01-01"   # 2 שנות warmup לפני תחילת הבאקטסט
+BACKTEST_START  = "2005-01-01"   # 20 שנה אחורה
+DATA_END        = datetime.now().strftime("%Y-%m-%d")
 
 
 # ─── טיקרים ────────────────────────────────────────────────────────────────
@@ -24,28 +20,42 @@ MIN_SCORE   = 7
 def get_tickers() -> list[str]:
     try:
         df = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-        tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
-        if len(tickers) > 100:
-            return tickers
-    except Exception as e:
-        logger.warning(f"Wikipedia נכשל: {e}")
-
+        t  = df["Symbol"].str.replace(".", "-", regex=False).tolist()
+        if len(t) > 100:
+            return t
+    except Exception:
+        pass
     try:
         url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
         df  = pd.read_csv(url)
-        tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
-        if len(tickers) > 100:
-            return tickers
-    except Exception as e:
-        logger.warning(f"GitHub נכשל: {e}")
+        t   = df["Symbol"].str.replace(".", "-", regex=False).tolist()
+        if len(t) > 100:
+            return t
+    except Exception:
+        pass
+    return ["AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","JPM","V","XOM",
+            "PG","MA","HD","CVX","MRK","ABBV","PEP","KO","BAC","AVGO"]
 
-    return [
-        "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","JPM","V","XOM",
-        "PG","MA","HD","CVX","MRK","ABBV","PEP","KO","BAC","AVGO","LLY",
-        "COST","TMO","CSCO","MCD","ACN","ABT","WMT","DHR","NEE","TXN","UNH",
-        "CRM","QCOM","HON","IBM","INTC","AMD","GE","CAT","BA","MMM","GS",
-        "MS","BLK","SPGI","AXP","ISRG","SYK","ZTS"
-    ]
+
+# ─── הורדת נתונים ──────────────────────────────────────────────────────────
+@st.cache_data(ttl=86400, show_spinner="מוריד 20 שנות נתונים — עשוי לקחת כמה דקות...")
+def download_data(tickers: list[str]):
+    all_t = ["SPY"] + tickers
+    raw   = yf.download(
+        all_t, start=DATA_START, end=DATA_END,
+        auto_adjust=True, progress=False, threads=True, group_by="ticker"
+    )
+    if isinstance(raw.columns, pd.MultiIndex):
+        close  = raw.xs("Close",  axis=1, level=1).ffill()
+        volume = raw.xs("Volume", axis=1, level=1).ffill()
+    else:
+        close  = raw[["Close"]].ffill()
+        volume = raw[["Volume"]].ffill()
+
+    # מסנן עמודות ריקות
+    close  = close.dropna(how="all",  axis=1)
+    volume = volume.dropna(how="all", axis=1)
+    return close, volume
 
 
 # ─── RSI ───────────────────────────────────────────────────────────────────
@@ -55,174 +65,180 @@ def calc_rsi(s: pd.Series, n: int = 14) -> float:
         return 50.0
     g = d.clip(lower=0).ewm(com=n - 1, adjust=False).mean()
     l = (-d.clip(upper=0)).ewm(com=n - 1, adjust=False).mean()
-    last_l = l.iloc[-1]
-    if last_l == 0:
-        return 100.0
-    return float(100 - 100 / (1 + g.iloc[-1] / last_l))
+    ll = l.iloc[-1]
+    return float(100.0) if ll == 0 else float(100 - 100 / (1 + g.iloc[-1] / ll))
 
 
-# ─── ניתוח מניה בודדת ──────────────────────────────────────────────────────
-def score_ticker(ticker: str, df: pd.DataFrame) -> dict | None:
-    try:
-        df = df[["Close", "Volume"]].dropna()
-        if len(df) < 252:   # צריך שנה מלאה לפחות ל-ROC 12M
-            return None
+# ─── ציון מניה ביום נתון ──────────────────────────────────────────────────
+def score_on_date(c: pd.Series, v: pd.Series, date) -> float:
+    """מחשב ציון ROC משוקלל ביום נתון — רק על נתונים עד אותו יום."""
+    c = c.loc[:date].dropna()
+    v = v.loc[:date].dropna()
 
-        c = df["Close"].astype(float)
-        v = df["Volume"].astype(float)
+    if len(c) < 252:
+        return 0.0
 
-        last_price = c.iloc[-1]
-        avg_vol    = v.tail(20).mean()
+    last = c.iloc[-1]
+    sma50  = c.iloc[-50:].mean()  if len(c) >= 50  else np.nan
+    sma100 = c.iloc[-100:].mean() if len(c) >= 100 else np.nan
+    sma200 = c.iloc[-200:].mean() if len(c) >= 200 else np.nan
 
-        if last_price < 5 or avg_vol < 500_000:
-            return None
+    if any(np.isnan(x) for x in [sma50, sma100, sma200]):
+        return 0.0
+    if not (sma50 > sma100 > sma200):   # חייב מבנה מדורג
+        return 0.0
+    if last < sma200:                    # חייב מעל ממוצע 200
+        return 0.0
 
-        sma50  = c.rolling(50).mean().iloc[-1]
-        sma100 = c.rolling(100).mean().iloc[-1]
-        sma200 = c.rolling(200).mean().iloc[-1]
+    roc3  = (c.iloc[-1] / c.iloc[-63]  - 1) * 100 if len(c) >= 63  else np.nan
+    roc6  = (c.iloc[-1] / c.iloc[-126] - 1) * 100 if len(c) >= 126 else np.nan
+    roc12 = (c.iloc[-1] / c.iloc[-252] - 1) * 100 if len(c) >= 252 else np.nan
 
-        # בדיקה שהממוצעים תקינים (לא NaN)
-        if any(np.isnan(x) for x in [sma50, sma100, sma200]):
-            return None
+    if any(np.isnan(x) for x in [roc3, roc6, roc12]):
+        return 0.0
 
-        roc3  = c.pct_change(63).iloc[-1]  * 100
-        roc6  = c.pct_change(126).iloc[-1] * 100
-        roc12 = c.pct_change(252).iloc[-1] * 100
+    rsi = calc_rsi(c)
+    if rsi > 75:   # קנייה יתר קיצונית — לא נכנסים
+        return 0.0
 
-        if any(np.isnan(x) for x in [roc3, roc6, roc12]):
-            return None
+    vol20 = v.iloc[-20:].mean() if len(v) >= 20 else 0
+    vol50 = v.iloc[-50:].mean() if len(v) >= 50 else 0
+    vol_ok = 1.0 if (vol50 > 0 and vol20 > vol50 * 1.2) else 0.0
 
-        vol20 = v.rolling(20).mean().iloc[-1]
-        vol50 = v.rolling(50).mean().iloc[-1]
-        rsi   = calc_rsi(c)
-
-        # פסילה מיידית
-        if rsi > 75:
-            return None
-
-        score = 0
-        if last_price > sma50:              score += 1
-        if last_price > sma100:             score += 1
-        if last_price > sma200:             score += 1
-        if sma50 > sma100 > sma200:         score += 1
-        if roc3  > 8:                       score += 1
-        if roc6  > 20:                      score += 1
-        if roc12 > 30:                      score += 1
-        if vol50 > 0 and vol20 > vol50 * 1.2: score += 1
-
-        if score < MIN_SCORE:
-            return None
-
-        return {
-            "סימול":      ticker,
-            "מחיר":       round(float(last_price), 2),
-            "ציון":       score,
-            "ROC 3M %":   round(float(roc3),  1),
-            "ROC 6M %":   round(float(roc6),  1),
-            "ROC 12M %":  round(float(roc12), 1),
-            "RSI":        round(float(rsi),   1),
-            "SMA50":      round(float(sma50),  2),
-            "SMA200":     round(float(sma200), 2),
-        }
-
-    except Exception as e:
-        logger.warning(f"שגיאה בניתוח {ticker}: {e}")
-        return None
+    # ציון משוקלל: ROC 6M חשוב ביותר, ואחריו ROC 12M ו-3M
+    score = (roc6 * 0.5) + (roc12 * 0.3) + (roc3 * 0.2) + (vol_ok * 5)
+    return float(score) if score > 0 else 0.0
 
 
-# ─── ניתוח batch ────────────────────────────────────────────────────────────
-def analyze_batch(tickers: list[str]) -> list[dict]:
-    if not tickers:
-        return []
-    try:
-        raw = yf.download(
-            tickers,
-            period=DATA_PERIOD,
-            interval="1d",
-            group_by="ticker",
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-        )
-    except Exception as e:
-        logger.error(f"שגיאת הורדה: {e}")
-        return []
+# ─── Walk-Forward Backtest ──────────────────────────────────────────────────
+def run_backtest(close, volume, top_n: int) -> tuple[pd.Series, pd.DataFrame]:
+    tickers     = [c for c in close.columns if c != "SPY"]
+    trading_days = close.index
+    # ימי המסחר האחרונים של כל רבעון
+    quarter_ends = pd.date_range(BACKTEST_START, DATA_END, freq="QE")
 
-    results = []
-    is_multi = isinstance(raw.columns, pd.MultiIndex)
+    port_values = [1.0]
+    dates_out   = [trading_days[trading_days.searchsorted(quarter_ends[0])]]
+    log_rows    = []
 
-    for t in tickers:
-        try:
-            if is_multi:
-                if t not in raw.columns.get_level_values(0):
-                    continue
-                df = raw[t].copy()
-            else:
-                # טיקר בודד — raw הוא flat DataFrame
-                df = raw.copy()
+    for i in range(len(quarter_ends) - 1):
+        e_date = trading_days[trading_days.searchsorted(quarter_ends[i],     side="left")]
+        x_date = trading_days[trading_days.searchsorted(quarter_ends[i + 1], side="left")]
 
-            res = score_ticker(t, df)
-            if res:
-                results.append(res)
-        except Exception as e:
-            logger.warning(f"{t}: {e}")
+        if e_date >= trading_days[-1] or x_date >= trading_days[-1]:
+            break
 
-    return results
+        # חישוב ציון לכל מניה ביום הכניסה
+        scores = {}
+        for t in tickers:
+            if t not in close.columns or t not in volume.columns:
+                continue
+            s = score_on_date(close[t], volume[t], e_date)
+            if s > 0:
+                scores[t] = s
+
+        if not scores:
+            port_values.append(port_values[-1])
+            dates_out.append(x_date)
+            log_rows.append({
+                "רבעון":          e_date.strftime("%Y-Q%q" if hasattr(e_date, 'quarter') else "%Y-%m"),
+                "מניות":          "— מזומן",
+                "תשואה %":        0.0,
+                "ציון ממוצע":     0.0,
+            })
+            continue
+
+        # בחירת Top N
+        top = sorted(scores, key=scores.get, reverse=True)[:top_n]
+
+        ep = close.loc[e_date, top].dropna()
+        xp = close.loc[x_date, ep.index].dropna()
+        common = ep.index.intersection(xp.index)
+
+        if common.empty:
+            port_values.append(port_values[-1])
+            dates_out.append(x_date)
+            continue
+
+        ret = ((xp[common] / ep[common]) - 1).mean()
+        port_values.append(port_values[-1] * (1 + ret))
+        dates_out.append(x_date)
+
+        log_rows.append({
+            "רבעון":      f"{e_date.year}-Q{(e_date.month-1)//3+1}",
+            "מניות":      "  |  ".join(common.tolist()),
+            "תשואה %":    round(ret * 100, 2),
+            "ציון ממוצע": round(np.mean([scores[t] for t in common]), 1),
+        })
+
+    return pd.Series(port_values, index=dates_out), pd.DataFrame(log_rows)
 
 
 # ─── ממשק ──────────────────────────────────────────────────────────────────
-min_score_ui = st.slider("ציון מינימלי (מתוך 8)", 4, 8, MIN_SCORE)
+top_n_ui = st.slider("כמה מניות לבחור כל רבעון", 3, 5, 3)
 st.divider()
 
-if st.button("🔍 סרוק עכשיו", type="primary"):
+if st.button("▶️ הרץ Backtest 20 שנה", type="primary"):
 
-    get_tickers.clear()
-    tickers       = get_tickers()
-    total_tickers = len(tickers)
+    tickers      = get_tickers()
+    close, volume = download_data(tickers)
 
-    st.info(f"סורק {total_tickers} מניות — זה יקח כ-2 דקות")
+    st.success(f"נטענו {close.shape[1]-1} מניות | {close.shape[0]:,} ימי מסחר")
 
-    bar           = st.progress(0)
-    status        = st.empty()
-    all_results   = []
-    scanned       = 0
-    total_batches = (total_tickers + BATCH_SIZE - 1) // BATCH_SIZE
+    with st.spinner("מריץ Walk-Forward על 80 רבעונים..."):
+        portfolio, log = run_backtest(close, volume, top_n_ui)
 
-    for i, start in enumerate(range(0, total_tickers, BATCH_SIZE)):
-        batch = tickers[start : start + BATCH_SIZE]
-        all_results.extend(analyze_batch(batch))
-        scanned += len(batch)
-        bar.progress(scanned / total_tickers)
-        status.text(f"סרוקו: {scanned}/{total_tickers} | עברו סף: {len(all_results)}")
-        if i < total_batches - 1:
-            time.sleep(SLEEP)
+    # ─── SPY נורמלי ────────────────────────────────────────────────────────
+    spy      = close["SPY"].dropna()
+    spy_bt   = spy[spy.index >= portfolio.index[0]]
+    spy_norm = spy_bt / spy_bt.iloc[0]
 
-    bar.empty()
-    status.empty()
+    # ─── מדדי ביצוע ────────────────────────────────────────────────────────
+    port_ret  = portfolio.iloc[-1] - 1
+    spy_ret   = spy_norm.iloc[-1]  - 1
+    port_q    = portfolio.pct_change().dropna()
+    sharpe    = (port_q.mean() / port_q.std() * np.sqrt(4)) if port_q.std() > 0 else 0
+    drawdown  = (portfolio / portfolio.cummax()) - 1
+    max_dd    = drawdown.min()
+    pos_q     = (port_q > 0).sum()
 
-    if not all_results:
-        st.warning("לא נמצאו מניות. נסה להוריד את הציון המינימלי.")
-        st.stop()
-
-    df_out = (
-        pd.DataFrame(all_results)
-        .query(f"ציון >= {min_score_ui}")
-        .sort_values("ROC 6M %", ascending=False)
-        .reset_index(drop=True)
+    # ─── גרף ───────────────────────────────────────────────────────────────
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=portfolio.index, y=portfolio.values,
+        name=f"מומנטום Top {top_n_ui}",
+        line=dict(color="#00C851", width=2.5)
+    ))
+    fig.add_trace(go.Scatter(
+        x=spy_norm.index, y=spy_norm.values,
+        name="S&P 500 (SPY)",
+        line=dict(color="#2196F3", width=2, dash="dot")
+    ))
+    fig.update_layout(
+        title=f"תשואה מצטברת — 20 שנה | Top {top_n_ui} מניות רבעוני",
+        yaxis_title="ערך (1.0 = נקודת פתיחה)",
+        yaxis_tickformat=".0%",
+        hovermode="x unified",
+        template="plotly_dark",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        height=500,
     )
-    df_out.index += 1
+    st.plotly_chart(fig, use_container_width=True)
 
-    st.success(
-        f"נסרקו {total_tickers} מניות | "
-        f"עברו סף: **{len(df_out)}** | "
-        f"ממוינות לפי ROC 6M"
-    )
-    st.dataframe(df_out, use_container_width=True)
+    # ─── מדדים ─────────────────────────────────────────────────────────────
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("תשואה כוללת",       f"{port_ret*100:.0f}%",
+              delta=f"{(port_ret-spy_ret)*100:.0f}% vs SPY")
+    m2.metric("SPY תשואה",         f"{spy_ret*100:.0f}%")
+    m3.metric("Sharpe (רבעוני×√4)", f"{sharpe:.2f}")
+    m4.metric("Max Drawdown",       f"{max_dd*100:.1f}%")
+    m5.metric("רבעונים חיוביים",   f"{pos_q}/{len(port_q)}")
 
-    csv = df_out.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        "📥 ייצא CSV",
-        csv,
-        f"momentum_{datetime.now().strftime('%Y%m%d')}.csv",
-        "text/csv",
-    )
+    # ─── לוג רבעוני ────────────────────────────────────────────────────────
+    st.divider()
+    with st.expander("📋 לוג רבעוני מלא — אילו מניות נבחרו בכל רבעון"):
+        st.dataframe(log, use_container_width=True)
+
+    csv = log.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("📥 ייצא לוג", csv,
+                       f"backtest_20y_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv")
