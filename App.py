@@ -173,9 +173,9 @@ def run_vcp_backtest(
                 raw_ret = (current_p / entry_p) - 1
                 if abs(raw_ret) > 0.60:
                     raw_ret = 0.0
-                ret  = max(raw_ret, -stop_pct)
+                ret   = max(raw_ret, -stop_pct)
+                # מחזירים את הקרן + רווח/הפסד
                 cash += position_size * (1 + ret)
-                cash -= position_size  # החזר את ה-slot
 
                 reason = "⛔ Stop Loss" if hit_stop else "⏱ זמן"
                 log_rows.append({
