@@ -6,12 +6,12 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 st.set_page_config(page_title="Momentum Backtest 20Y", layout="wide")
-st.title("📊 Backtest מומנטום — 20 שנה | רבעוני | Top 3-5 מניות")
+st.title("📊 Backtest מומנטום — 10 שנים | רבעוני | Top 3-5 מניות")
 st.caption("יקום: S&P 500 | איזון: סוף כל רבעון | בנצ'מרק: SPY")
 
 # ─── קבועים ────────────────────────────────────────────────────────────────
-DATA_START      = "2003-01-01"   # 2 שנות warmup לפני תחילת הבאקטסט
-BACKTEST_START  = "2005-01-01"   # 20 שנה אחורה
+DATA_START      = "2013-01-01"   # 2 שנות warmup לפני תחילת הבאקטסט
+BACKTEST_START  = "2015-01-01"   # 10 שנה אחורה
 DATA_END        = datetime.now().strftime("%Y-%m-%d")
 
 
@@ -160,7 +160,20 @@ def run_backtest(close, volume, top_n: int) -> tuple[pd.Series, pd.DataFrame]:
             dates_out.append(x_date)
             continue
 
-        ret = ((xp[common] / ep[common]) - 1).mean()
+        # ─── פילטר נתונים שגויים ──────────────────────────────────────
+        # פוסל מניה שעלתה/ירדה מעל 60% ברבעון — כנראה נתון זבל
+        raw_rets = (xp[common] / ep[common]) - 1
+        valid    = raw_rets[raw_rets.abs() < 0.60].index
+        if valid.empty:
+            port_values.append(port_values[-1])
+            dates_out.append(x_date)
+            continue
+
+        # ─── הגבלת הפסד לפוזיציה — Stop Loss 20% ─────────────────────
+        # אם מניה ירדה יותר מ-20% — מגבילים את ההפסד ל-20%
+        capped = raw_rets[valid].clip(lower=-0.20)
+        ret    = capped.mean()
+
         port_values.append(port_values[-1] * (1 + ret))
         dates_out.append(x_date)
 
@@ -215,7 +228,7 @@ if st.button("▶️ הרץ Backtest 20 שנה", type="primary"):
         line=dict(color="#2196F3", width=2, dash="dot")
     ))
     fig.update_layout(
-        title=f"תשואה מצטברת — 20 שנה | Top {top_n_ui} מניות רבעוני",
+        title=f"תשואה מצטברת — 10 שנים | Top {top_n_ui} מניות רבעוני",
         yaxis_title="ערך (1.0 = נקודת פתיחה)",
         yaxis_tickformat=".0%",
         hovermode="x unified",
