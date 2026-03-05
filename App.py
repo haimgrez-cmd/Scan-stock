@@ -1,24 +1,19 @@
-import time
-import logging
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import plotly.graph_objects as go
 from datetime import datetime
 
-logging.basicConfig(level=logging.WARNING)
-logger = logging.getLogger(__name__)
+st.set_page_config(page_title="VCP Backtest", layout="wide")
+st.title("📊 Backtest VCP — 10 שנים")
+st.caption("יקום: S&P 500 | כניסה: זיהוי VCP | יציאה: Stop Loss או מקסימום 3 חודשים")
 
-st.set_page_config(page_title="סורק מומנטום", layout="wide")
-st.title("📈 סורק מומנטום — גרסה מנצחת")
-st.caption(
-    f"אותו מודל שהוכח בבאקטסט: 5,700% | Sharpe 1.62 | Drawdown 20% | "
-    f"עדכון: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
-)
-
-DATA_PERIOD = "380d"
-BATCH_SIZE  = 50
-SLEEP       = 1.0
+DATA_START     = "2013-01-01"
+BACKTEST_START = "2015-01-01"
+DATA_END       = datetime.now().strftime("%Y-%m-%d")
+HOLD_DAYS      = 63   # ~3 חודשים
+STOP_LOSS      = 0.07 # 7% מתחת לתחתית הבסיס
 
 
 # ─── טיקרים ────────────────────────────────────────────────────────────────
@@ -39,13 +34,33 @@ def get_tickers() -> list[str]:
             return t
     except Exception:
         pass
-    return [
-        "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","JPM","V","XOM",
-        "PG","MA","HD","CVX","MRK","ABBV","PEP","KO","BAC","AVGO","LLY",
-        "COST","TMO","CSCO","MCD","ACN","ABT","WMT","DHR","NEE","TXN","UNH",
-        "CRM","QCOM","HON","IBM","INTC","AMD","GE","CAT","BA","MMM","GS",
-        "MS","BLK","SPGI","AXP","ISRG","SYK","ZTS"
-    ]
+    return ["AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","JPM","V","XOM",
+            "PG","MA","HD","CVX","MRK","ABBV","PEP","KO","BAC","AVGO"]
+
+
+# ─── הורדת נתונים ──────────────────────────────────────────────────────────
+@st.cache_data(ttl=86400, show_spinner="מוריד נתונים היסטוריים...")
+def download_data(tickers: list[str]):
+    raw = yf.download(
+        ["SPY"] + tickers, start=DATA_START, end=DATA_END,
+        auto_adjust=True, progress=False, threads=True, group_by="ticker"
+    )
+    if isinstance(raw.columns, pd.MultiIndex):
+        close  = raw.xs("Close",  axis=1, level=1).ffill()
+        high   = raw.xs("High",   axis=1, level=1).ffill()
+        low    = raw.xs("Low",    axis=1, level=1).ffill()
+        volume = raw.xs("Volume", axis=1, level=1).ffill()
+    else:
+        close  = raw[["Close"]].ffill()
+        high   = raw[["High"]].ffill()
+        low    = raw[["Low"]].ffill()
+        volume = raw[["Volume"]].ffill()
+    return (
+        close.dropna(how="all",  axis=1),
+        high.dropna(how="all",   axis=1),
+        low.dropna(how="all",    axis=1),
+        volume.dropna(how="all", axis=1),
+    )
 
 
 # ─── RSI ───────────────────────────────────────────────────────────────────
@@ -59,168 +74,275 @@ def calc_rsi(s: pd.Series, n: int = 14) -> float:
     return 100.0 if ll == 0 else float(100 - 100 / (1 + g.iloc[-1] / ll))
 
 
-# ─── ציון משוקלל — זהה לבאקטסט ────────────────────────────────────────────
-def calc_score(ticker: str, df: pd.DataFrame) -> dict | None:
-    try:
-        df = df[["Close", "Volume"]].dropna()
-        if len(df) < 252:
-            return None
+# ─── זיהוי VCP ביום נתון ──────────────────────────────────────────────────
+def is_vcp(c, h, l, v, date) -> tuple[bool, float]:
+    """
+    מחזיר (True, תחתית_בסיס) אם יש VCP ביום הנתון.
+    תחתית הבסיס משמשת לחישוב Stop Loss.
+    """
+    c = c.loc[:date].dropna()
+    h = h.loc[:date].dropna()
+    l = l.loc[:date].dropna()
+    v = v.loc[:date].dropna()
 
-        c = df["Close"].astype(float)
-        v = df["Volume"].astype(float)
+    if len(c) < 200:
+        return False, 0.0
 
-        last  = c.iloc[-1]
-        avg_vol = v.tail(20).mean()
+    last   = float(c.iloc[-1])
+    sma50  = float(c.iloc[-50:].mean())
+    sma150 = float(c.iloc[-150:].mean()) if len(c) >= 150 else np.nan
+    sma200 = float(c.iloc[-200:].mean())
 
-        if last < 5 or avg_vol < 500_000:
-            return None
+    if any(np.isnan(x) for x in [sma50, sma150, sma200]):
+        return False, 0.0
+    if not (last > sma200):             return False, 0.0
+    if not (sma50 > sma150 > sma200):   return False, 0.0
 
-        sma50  = c.iloc[-50:].mean()
-        sma100 = c.iloc[-100:].mean()
-        sma200 = c.iloc[-200:].mean()
+    high_52w      = float(h.iloc[-252:].max())
+    pct_from_high = (high_52w - last) / high_52w * 100
+    if pct_from_high > 20:              return False, 0.0
 
-        if any(np.isnan(x) for x in [sma50, sma100, sma200]):
-            return None
+    atr20 = float((h.iloc[-20:] - l.iloc[-20:]).mean())
+    atr60 = float((h.iloc[-60:] - l.iloc[-60:]).mean())
+    if atr60 == 0:                      return False, 0.0
+    if atr20 / atr60 > 0.80:           return False, 0.0
 
-        # ─── תנאי סף קשיחים — חייב לעבור הכל ──────────────────────────
-        if not (sma50 > sma100 > sma200):   # ממוצעים מדורגים
-            return None
-        if last < sma200:                    # מחיר מעל ממוצע 200
-            return None
+    recent_high = float(h.iloc[-20:].max())
+    recent_low  = float(l.iloc[-20:].min())
+    if recent_low == 0:                 return False, 0.0
+    base_width  = (recent_high - recent_low) / recent_low * 100
+    if base_width > 15:                 return False, 0.0
 
-        roc3  = (c.iloc[-1] / c.iloc[-63]  - 1) * 100 if len(c) >= 63  else None
-        roc6  = (c.iloc[-1] / c.iloc[-126] - 1) * 100 if len(c) >= 126 else None
-        roc12 = (c.iloc[-1] / c.iloc[-252] - 1) * 100 if len(c) >= 252 else None
+    vol_recent = float(v.iloc[-20:].mean())
+    vol_prior  = float(v.iloc[-60:-20].mean())
+    if vol_prior == 0:                  return False, 0.0
+    if vol_recent / vol_prior > 0.85:   return False, 0.0
 
-        if any(x is None or np.isnan(x) for x in [roc3, roc6, roc12]):
-            return None
+    rsi = calc_rsi(c)
+    if rsi < 40 or rsi > 70:           return False, 0.0
 
-        # פסילה: ירידה בטווח כלשהו — רק מניות עולות בכל הטווחים
-        if roc3 < 0 or roc6 < 0 or roc12 < 0:
-            return None
-
-        rsi = calc_rsi(c)
-        if rsi > 75:
-            return None
-
-        vol20 = v.iloc[-20:].mean()
-        vol50 = v.iloc[-50:].mean()
-        vol_bonus = 5.0 if (vol50 > 0 and vol20 > vol50 * 1.2) else 0.0
-
-        # ─── ציון משוקלל — זהה בדיוק לבאקטסט ──────────────────────────
-        score = (roc6 * 0.5) + (roc12 * 0.3) + (roc3 * 0.2) + vol_bonus
-
-        if score <= 0:
-            return None
-
-        return {
-            "סימול":     ticker,
-            "מחיר":      round(float(last), 2),
-            "ציון":      round(float(score), 1),
-            "ROC 3M %":  round(float(roc3),  1),
-            "ROC 6M %":  round(float(roc6),  1),
-            "ROC 12M %": round(float(roc12), 1),
-            "RSI":       round(float(rsi),   1),
-            "SMA50":     round(float(sma50),  2),
-            "SMA200":    round(float(sma200), 2),
-        }
-
-    except Exception as e:
-        logger.warning(f"{ticker}: {e}")
-        return None
+    return True, recent_low
 
 
-# ─── batch ─────────────────────────────────────────────────────────────────
-def analyze_batch(tickers: list[str]) -> list[dict]:
-    if not tickers:
-        return []
-    try:
-        raw = yf.download(
-            tickers, period=DATA_PERIOD, interval="1d",
-            group_by="ticker", auto_adjust=True,
-            progress=False, threads=True,
-        )
-    except Exception as e:
-        logger.error(e)
-        return []
+# ─── Backtest ──────────────────────────────────────────────────────────────
+def run_vcp_backtest(
+    close, high, low, volume,
+    tickers, scan_freq, stop_pct, hold_days
+) -> tuple[pd.Series, pd.DataFrame]:
 
-    results  = []
-    is_multi = isinstance(raw.columns, pd.MultiIndex)
+    trading_days = close.index
+    scan_dates   = pd.date_range(BACKTEST_START, DATA_END, freq=scan_freq)
 
-    for t in tickers:
-        try:
-            df = raw[t].copy() if is_multi else raw.copy()
-            res = calc_score(t, df)
-            if res:
-                results.append(res)
-        except Exception as e:
-            logger.warning(f"{t}: {e}")
+    # פורטפוליו שווה משקל — נניח עד 5 פוזיציות במקביל
+    MAX_POSITIONS = 5
+    portfolio     = {i: None for i in range(MAX_POSITIONS)}  # slot → {ticker, entry, stop, entry_date}
+    cash          = 1.0
+    position_size = 1.0 / MAX_POSITIONS
 
-    return results
+    equity_curve  = pd.Series(dtype=float)
+    log_rows      = []
+
+    for scan_date in scan_dates:
+        idx = trading_days.searchsorted(scan_date, side="left")
+        if idx >= len(trading_days):
+            break
+        today = trading_days[idx]
+
+        # ─── סגור פוזיציות שהגיעו לסיום (Hold או Stop) ──────────────
+        for slot, pos in portfolio.items():
+            if pos is None:
+                continue
+            t         = pos["ticker"]
+            entry_p   = pos["entry"]
+            stop_p    = pos["stop"]
+            entry_d   = pos["entry_date"]
+            days_held = (today - entry_d).days
+
+            if t not in close.columns:
+                continue
+
+            current_p = float(close.loc[today, t]) if today in close.index else entry_p
+
+            # Stop Loss פגע
+            hit_stop = current_p <= stop_p
+            # הגענו לסוף תקופת ההחזקה
+            hit_time = days_held >= hold_days
+
+            if hit_stop or hit_time:
+                # פסילת נתון זבל
+                raw_ret = (current_p / entry_p) - 1
+                if abs(raw_ret) > 0.60:
+                    raw_ret = 0.0
+                ret  = max(raw_ret, -stop_pct)
+                cash += position_size * (1 + ret)
+                cash -= position_size  # החזר את ה-slot
+
+                reason = "⛔ Stop Loss" if hit_stop else "⏱ זמן"
+                log_rows.append({
+                    "תאריך כניסה":  entry_d.strftime("%Y-%m-%d"),
+                    "תאריך יציאה":  today.strftime("%Y-%m-%d"),
+                    "סימול":        t,
+                    "כניסה":        round(entry_p, 2),
+                    "יציאה":        round(current_p, 2),
+                    "תשואה %":      round(ret * 100, 2),
+                    "סיבת יציאה":   reason,
+                })
+                portfolio[slot] = None
+
+        # ─── חפש VCP חדש למלא slots פנויים ──────────────────────────
+        open_slots = [s for s, p in portfolio.items() if p is None]
+        if not open_slots:
+            equity_curve[today] = cash + sum(
+                position_size for p in portfolio.values() if p is not None
+            )
+            continue
+
+        candidates = []
+        for t in tickers:
+            if t not in close.columns:
+                continue
+            # לא להיכנס שוב למניה שכבר פתוחה
+            if any(p and p["ticker"] == t for p in portfolio.values()):
+                continue
+            try:
+                found, base_low = is_vcp(
+                    close[t], high[t], low[t], volume[t], today
+                )
+                if found:
+                    roc6 = (float(close.loc[today, t]) /
+                            float(close[t].loc[:today].iloc[-126]) - 1) * 100
+                    candidates.append((t, base_low, roc6))
+            except Exception:
+                continue
+
+        # מיון לפי ROC 6M — הכי חזק קודם
+        candidates.sort(key=lambda x: x[2], reverse=True)
+
+        for slot in open_slots:
+            if not candidates:
+                break
+            t, base_low, _ = candidates.pop(0)
+            entry_p = float(close.loc[today, t])
+            stop_p  = base_low * (1 - stop_pct * 0.3)  # stop מתחת לתחתית הבסיס
+            cash   -= position_size
+            portfolio[slot] = {
+                "ticker":     t,
+                "entry":      entry_p,
+                "stop":       stop_p,
+                "entry_date": today,
+            }
+
+        # ─── ערך פורטפוליו כולל ──────────────────────────────────────
+        open_val = 0.0
+        for pos in portfolio.values():
+            if pos is None:
+                continue
+            t = pos["ticker"]
+            if t in close.columns and today in close.index:
+                cur = float(close.loc[today, t])
+                raw = (cur / pos["entry"]) - 1
+                raw = max(min(raw, 0.60), -stop_pct)
+                open_val += position_size * (1 + raw)
+
+        equity_curve[today] = cash + open_val
+
+    return equity_curve, pd.DataFrame(log_rows)
 
 
 # ─── ממשק ──────────────────────────────────────────────────────────────────
-top_n_ui = st.slider("כמה מניות לבחור (Top N)", 3, 5, 3)
-
-st.info(
-    "💡 הסורק בוחר את המניות לפי **אותו ציון משוקלל** שהוכח בבאקטסט:\n"
-    "ROC 6M × 0.5 + ROC 12M × 0.3 + ROC 3M × 0.2 + בונוס ווליום"
-)
+c1, c2, c3 = st.columns(3)
+hold_months = c1.slider("תקופת החזקה (חודשים)", 1, 6, 3)
+stop_pct_ui = c2.slider("Stop Loss %", 5, 15, 7)
+scan_freq   = c3.selectbox("תדירות סריקה", ["W-FRI", "2W-FRI", "ME"], index=0,
+                            format_func=lambda x: {"W-FRI":"שבועי","2W-FRI":"דו-שבועי","ME":"חודשי"}[x])
+hold_days_ui = hold_months * 21
 st.divider()
 
-if st.button("🔍 סרוק עכשיו", type="primary"):
+if st.button("▶️ הרץ Backtest VCP", type="primary"):
 
-    get_tickers.clear()
-    tickers       = get_tickers()
-    total_tickers = len(tickers)
+    tickers      = get_tickers()
+    close, high, low, volume = download_data(tickers)
+    score_tickers = [t for t in close.columns if t != "SPY"]
 
-    st.info(f"סורק {total_tickers} מניות S&P 500...")
+    st.success(f"נטענו {len(score_tickers)} מניות")
 
-    bar           = st.progress(0)
-    status        = st.empty()
-    all_results   = []
-    scanned       = 0
-    total_batches = (total_tickers + BATCH_SIZE - 1) // BATCH_SIZE
+    with st.spinner("מריץ Backtest VCP..."):
+        equity, log = run_vcp_backtest(
+            close, high, low, volume,
+            score_tickers,
+            scan_freq,
+            stop_pct_ui / 100,
+            hold_days_ui,
+        )
 
-    for i, start in enumerate(range(0, total_tickers, BATCH_SIZE)):
-        batch = tickers[start : start + BATCH_SIZE]
-        all_results.extend(analyze_batch(batch))
-        scanned += len(batch)
-        bar.progress(scanned / total_tickers)
-        status.text(f"סרוקו: {scanned}/{total_tickers} | עברו סף: {len(all_results)}")
-        if i < total_batches - 1:
-            time.sleep(SLEEP)
-
-    bar.empty()
-    status.empty()
-
-    if not all_results:
-        st.warning("לא נמצאו מניות. השוק אולי חלש — נסה להוריד את Top N.")
+    if equity.empty:
+        st.warning("לא נמצאו אותות VCP בתקופה.")
         st.stop()
 
-    df_all = (
-        pd.DataFrame(all_results)
-        .sort_values("ציון", ascending=False)
-        .reset_index(drop=True)
+    # ─── SPY ────────────────────────────────────────────────────────────
+    spy      = close["SPY"].dropna()
+    spy_bt   = spy[spy.index >= equity.index[0]]
+    spy_norm = spy_bt / spy_bt.iloc[0]
+
+    # ─── מדדים ──────────────────────────────────────────────────────────
+    port_ret = equity.iloc[-1] - 1
+    spy_ret  = spy_norm.iloc[-1] - 1
+    rets     = equity.pct_change().dropna()
+    sharpe   = (rets.mean() / rets.std() * np.sqrt(252)) if rets.std() > 0 else 0
+    drawdown = (equity / equity.cummax()) - 1
+    max_dd   = drawdown.min()
+
+    if not log.empty:
+        win_rate = (log["תשואה %"] > 0).mean() * 100
+        avg_win  = log.loc[log["תשואה %"] > 0, "תשואה %"].mean()
+        avg_loss = log.loc[log["תשואה %"] < 0, "תשואה %"].mean()
+    else:
+        win_rate = avg_win = avg_loss = 0
+
+    # ─── גרף ────────────────────────────────────────────────────────────
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=equity.index, y=equity.values,
+        name="VCP Strategy",
+        line=dict(color="#FF6B35", width=2.5)
+    ))
+    fig.add_trace(go.Scatter(
+        x=spy_norm.index, y=spy_norm.values,
+        name="S&P 500 (SPY)",
+        line=dict(color="#2196F3", width=2, dash="dot")
+    ))
+    fig.update_layout(
+        title="VCP Strategy vs S&P 500 — 10 שנים",
+        yaxis_title="ערך (1.0 = נקודת פתיחה)",
+        yaxis_tickformat=".0%",
+        hovermode="x unified",
+        template="plotly_dark",
+        height=480,
     )
+    st.plotly_chart(fig, use_container_width=True)
 
-    # Top N — אלה המניות לקנות הרבעון הזה
-    df_top = df_all.head(top_n_ui).copy()
-    df_top.index += 1
+    # ─── מדדים ──────────────────────────────────────────────────────────
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("תשואה כוללת",   f"{port_ret*100:.0f}%",
+              delta=f"{(port_ret-spy_ret)*100:.0f}% vs SPY")
+    m2.metric("SPY",            f"{spy_ret*100:.0f}%")
+    m3.metric("Sharpe",         f"{sharpe:.2f}")
+    m4.metric("Max Drawdown",   f"{max_dd*100:.1f}%")
+    m5.metric("Win Rate",       f"{win_rate:.0f}%")
+    m6.metric("עסקאות",         len(log))
 
-    st.success(f"✅ נסרקו {total_tickers} מניות | עברו סף: {len(df_all)} | מוצגות Top {top_n_ui}")
+    if not log.empty:
+        st.caption(
+            f"רווח ממוצע: {avg_win:.1f}% | "
+            f"הפסד ממוצע: {avg_loss:.1f}% | "
+            f"יחס R:R: {abs(avg_win/avg_loss):.1f}" if avg_loss != 0 else ""
+        )
 
-    st.subheader(f"🏆 Top {top_n_ui} — המניות לקנות הרבעון הזה")
-    st.dataframe(df_top, use_container_width=True)
+    # ─── לוג עסקאות ─────────────────────────────────────────────────────
+    st.divider()
+    with st.expander("📋 לוג כל העסקאות"):
+        st.dataframe(log, use_container_width=True)
 
-    with st.expander(f"📋 כל {len(df_all)} המניות שעברו סף"):
-        df_all.index += 1
-        st.dataframe(df_all, use_container_width=True)
-
-    csv = df_top.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        "📥 ייצא Top N ל-CSV",
-        csv,
-        f"momentum_top{top_n_ui}_{datetime.now().strftime('%Y%m%d')}.csv",
-        "text/csv",
-    )
+    csv = log.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("📥 ייצא לוג", csv,
+                       f"vcp_backtest_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv")
