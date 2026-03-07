@@ -1,409 +1,336 @@
+import time
+import logging
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
 from datetime import datetime
 
-st.set_page_config(page_title="Value Backtest", layout="wide")
-st.title("📊 Backtest ערך — 10 שנים")
-st.caption("יקום: S&P 500 | קנייה: P/E + P/B נמוכים היסטורית | מכירה: הגעה לשווי הוגן")
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger(__name__)
 
-DATA_START     = "2013-01-01"
-BACKTEST_START = "2015-01-01"
-DATA_END       = datetime.now().strftime("%Y-%m-%d")
+st.set_page_config(page_title="סורק ערך", layout="wide")
+st.title("💎 סורק מניות ערך — Buffett Style")
+st.caption(f"S&P 500 + נאסד\"ק | החזקה עד שווי הוגן | עדכון: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+
+BATCH_SIZE   = 20
+SLEEP        = 1.5
+MIN_MARKET_CAP = 2_000_000_000  # מינימום 2B — איכות מינימלית
 
 
-with st.expander("ℹ️ איך הבאקטסט עובד?"):
+with st.expander("ℹ️ איך מחושב השווי ההוגן?"):
     st.markdown("""
-    **מה מחושב מנתוני מחיר בלבד (ללא look-ahead bias):**
-    - **P/E היסטורי** — מחיר / EPS נוכחי × (מחיר היסטורי / מחיר נוכחי)
-    - **P/B היסטורי** — אותו עיקרון עם Book Value
-    - **מרווח ביטחון** — כמה המניה זולה ביחס לשווי ההוגן באותו יום
+    **שווי הוגן = ממוצע שלושה מודלים:**
     
-    **לוגיקת קנייה:** P/E < 15 וגם P/B < 2 וגם מרווח ביטחון > 25%  
-    **לוגיקת מכירה:** מרווח ביטחון < 5% (הגיעה לשווי הוגן) או החזקה מקסימלית 2 שנות
+    1. **P/E הוגן** — EPS × P/E ממוצע של הסקטור (או 15 כברירת מחדל)
+    2. **P/B הוגן** — Book Value × P/B ממוצע של הסקטור (או 2)  
+    3. **DCF פשוט** — FCF הנוכחי × מכפיל צמיחה (10 שנים, היוון 10%)
     
-    **סריקה:** פעמיים בשנה — פברואר ואוגוסט (אחרי דוחות)
+    **מרווח ביטחון** = כמה % המחיר נמוך משווי הוגן.  
+    Buffett רוצה לפחות **30%** מרווח ביטחון לפני קנייה.
+    
+    **7 קריטריוני הבסיס:**
+    P/E < 20 | P/B < 3 | ROE > 15% | חוב/הון < 100% | FCF חיובי | מרג'ין > 10% | צמיחה חיובית
     """)
 
 
 # ─── טיקרים ────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400)
 def get_tickers() -> list[str]:
+    tickers = set()
+
+    # S&P 500
     try:
         df = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-        t  = df["Symbol"].str.replace(".", "-", regex=False).tolist()
-        if len(t) > 100:
-            return t
+        sp = df["Symbol"].str.replace(".", "-", regex=False).tolist()
+        if len(sp) > 100:
+            tickers.update(sp)
     except Exception:
         pass
+
+    # נאסד"ק 100
     try:
-        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
-        df  = pd.read_csv(url)
-        t   = df["Symbol"].str.replace(".", "-", regex=False).tolist()
-        if len(t) > 100:
-            return t
+        df = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")[4]
+        nq = df["Ticker"].str.replace(".", "-", regex=False).tolist()
+        tickers.update(nq)
     except Exception:
         pass
-    return ["AAPL","MSFT","GOOGL","BRK-B","JPM","JNJ","PG","KO","WMT",
-            "CVX","XOM","BAC","UNH","HD","MCD","V","MA","ABT","TMO","DHR"]
 
-
-# ─── הורדת נתונים ──────────────────────────────────────────────────────────
-@st.cache_data(ttl=86400, show_spinner="מוריד נתונים היסטוריים...")
-def download_prices(tickers: list[str]) -> pd.DataFrame:
-    raw = yf.download(
-        ["SPY"] + tickers, start=DATA_START, end=DATA_END,
-        auto_adjust=True, progress=False, threads=True, group_by="ticker"
-    )
-    if isinstance(raw.columns, pd.MultiIndex):
-        close = raw.xs("Close", axis=1, level=1).ffill()
-    else:
-        close = raw[["Close"]].ffill()
-    return close.dropna(how="all", axis=1)
-
-
-@st.cache_data(ttl=86400, show_spinner="מוריד נתונים פונדמנטליים נוכחיים...")
-def get_fundamentals(tickers: list[str]) -> pd.DataFrame:
-    """
-    שולף נתונים נוכחיים ומשתמש בהם כבסיס לחישוב היסטורי.
-    זה לא מושלם — אבל ללא look-ahead bias כי אנחנו משתמשים
-    ביחסים (P/E, P/B) ולא במחירים מוחלטים.
-    """
-    rows = []
-    progress = st.progress(0)
-    for i, t in enumerate(tickers):
+    # GitHub fallback ל-S&P 500
+    if len(tickers) < 100:
         try:
-            info = yf.Ticker(t).info
-            if not info:
-                continue
-            pe    = info.get("trailingPE")
-            pb    = info.get("priceToBook")
-            price = info.get("currentPrice") or info.get("regularMarketPrice")
-            eps   = info.get("trailingEps")
-            bvps  = info.get("bookValue")
-
-            if not all([pe, pb, price, eps, bvps]):
-                continue
-            if pe <= 0 or pb <= 0 or price <= 0:
-                continue
-
-            rows.append({
-                "ticker": t,
-                "current_price": price,
-                "eps":   eps,
-                "bvps":  bvps,
-                "pe":    pe,
-                "pb":    pb,
-            })
+            url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+            df  = pd.read_csv(url)
+            tickers.update(df["Symbol"].str.replace(".", "-", regex=False).tolist())
         except Exception:
             pass
-        progress.progress((i + 1) / len(tickers))
 
-    progress.empty()
-    return pd.DataFrame(rows).set_index("ticker") if rows else pd.DataFrame()
+    if len(tickers) < 20:
+        tickers.update(["AAPL","MSFT","GOOGL","AMZN","META","BRK-B","JPM","JNJ",
+                         "PG","KO","WMT","CVX","XOM","BAC","UNH","HD","MCD","V"])
+
+    return sorted(tickers)
 
 
-# ─── חישוב P/E ו-P/B היסטורי ──────────────────────────────────────────────
-def compute_historical_ratios(
-    close: pd.DataFrame, fundamentals: pd.DataFrame
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+# ─── שווי הוגן ─────────────────────────────────────────────────────────────
+# P/E הוגן לפי סקטור — מבוסס על ממוצעים היסטוריים
+SECTOR_PE = {
+    "Technology": 25, "Healthcare": 20, "Financial Services": 14,
+    "Consumer Defensive": 18, "Consumer Cyclical": 16, "Industrials": 17,
+    "Energy": 12, "Utilities": 15, "Real Estate": 20,
+    "Communication Services": 20, "Basic Materials": 14,
+}
+SECTOR_PB = {
+    "Technology": 5, "Healthcare": 4, "Financial Services": 1.5,
+    "Consumer Defensive": 4, "Consumer Cyclical": 3, "Industrials": 3,
+    "Energy": 1.5, "Utilities": 1.5, "Real Estate": 2,
+    "Communication Services": 3, "Basic Materials": 2,
+}
+
+def calc_fair_value(info: dict) -> tuple[float, float]:
     """
-    P/E היסטורי = (מחיר היסטורי / מחיר נוכחי) × P/E נוכחי
-    — שקול לחישוב EPS קבוע עם מחיר משתנה (קירוב סביר)
+    מחזיר (שווי_הוגן, מרווח_ביטחון_%).
+    משתמש בממוצע עד 3 מודלים לפי זמינות הנתונים.
     """
-    tickers = [t for t in fundamentals.index if t in close.columns]
-    pe_hist = pd.DataFrame(index=close.index, columns=tickers, dtype=float)
-    pb_hist = pd.DataFrame(index=close.index, columns=tickers, dtype=float)
+    sector   = info.get("sector", "")
+    price    = info.get("currentPrice") or info.get("regularMarketPrice") or 0
+    eps      = info.get("trailingEps")
+    bvps     = info.get("bookValue")
+    fcf      = info.get("freeCashflow")
+    shares   = info.get("sharesOutstanding")
+    growth   = info.get("revenueGrowth") or 0.05
 
-    for t in tickers:
-        cur_p = fundamentals.loc[t, "current_price"]
-        cur_pe = fundamentals.loc[t, "pe"]
-        cur_pb = fundamentals.loc[t, "pb"]
+    fair_pe  = SECTOR_PE.get(sector, 15)
+    fair_pb  = SECTOR_PB.get(sector, 2)
 
-        if cur_p <= 0:
-            continue
+    estimates = []
 
-        ratio = close[t] / cur_p
-        pe_hist[t] = ratio * cur_pe
-        pb_hist[t] = ratio * cur_pb
+    # מודל 1: P/E הוגן
+    if eps and eps > 0:
+        estimates.append(eps * fair_pe)
 
-    return pe_hist, pb_hist
+    # מודל 2: P/B הוגן
+    if bvps and bvps > 0:
+        estimates.append(bvps * fair_pb)
+
+    # מודל 3: DCF פשוט
+    if fcf and shares and shares > 0 and fcf > 0:
+        fcf_per_share = fcf / shares
+        discount_rate = 0.10
+        g             = min(max(growth, 0.02), 0.15)  # מגביל בין 2% ל-15%
+        # סכום FCF 10 שנים + ערך שייר
+        dcf = sum(fcf_per_share * (1 + g) ** yr / (1 + discount_rate) ** yr
+                  for yr in range(1, 11))
+        dcf += (fcf_per_share * (1 + g) ** 10 / (discount_rate - 0.03)) / (1 + discount_rate) ** 10
+        estimates.append(dcf)
+
+    if not estimates or price <= 0:
+        return 0.0, 0.0
+
+    fair_value    = float(np.mean(estimates))
+    margin_safety = (fair_value - price) / fair_value * 100
+
+    return round(fair_value, 2), round(margin_safety, 1)
 
 
-# ─── שווי הוגן היסטורי ─────────────────────────────────────────────────────
-def compute_fair_value(close: pd.DataFrame, fundamentals: pd.DataFrame) -> pd.DataFrame:
-    """
-    שווי הוגן = ממוצע (EPS × 15) ו-(BVPS × 2)
-    מחושב עם EPS ו-BVPS נוכחיים — קירוב סביר לטווח של 10 שנים
-    """
-    tickers = [t for t in fundamentals.index if t in close.columns]
-    fv = pd.DataFrame(index=close.index, columns=tickers, dtype=float)
+# ─── ניתוח מניה ────────────────────────────────────────────────────────────
+def analyze_ticker(ticker: str) -> dict | None:
+    try:
+        stock = yf.Ticker(ticker)
+        info  = stock.info
 
-    for t in tickers:
-        eps  = fundamentals.loc[t, "eps"]
-        bvps = fundamentals.loc[t, "bvps"]
-        fair = np.mean([eps * 15, bvps * 2])
-        if fair > 0:
-            fv[t] = fair
+        if not info or "symbol" not in info:
+            return None
 
-    return fv
+        pe          = info.get("trailingPE")
+        pb          = info.get("priceToBook")
+        roe         = info.get("returnOnEquity")
+        debt_equity = info.get("debtToEquity")
+        fcf         = info.get("freeCashflow")
+        margin      = info.get("profitMargins")
+        rev_growth  = info.get("revenueGrowth")
+        price       = info.get("currentPrice") or info.get("regularMarketPrice")
+        market_cap  = info.get("marketCap")
+        name        = info.get("shortName", ticker)
+        sector      = info.get("sector", "—")
+        div_yield   = info.get("dividendYield")
 
+        if not price or not market_cap or market_cap < MIN_MARKET_CAP:
+            return None
 
-# ─── Backtest ──────────────────────────────────────────────────────────────
-def run_backtest(
-    close, pe_hist, pb_hist, fair_value,
-    pe_thresh, pb_thresh, margin_buy, margin_sell, max_hold_days, max_pos
-) -> tuple[pd.Series, pd.DataFrame]:
+        # ─── ניקוד 7 קריטריונים ────────────────────────────────────
+        score = 0
+        if pe         and 0 < pe < 20:          score += 1
+        if pb         and 0 < pb < 3:           score += 1
+        if roe        and roe > 0.15:            score += 1
+        if debt_equity is not None and debt_equity < 100: score += 1
+        if fcf        and fcf > 0:              score += 1
+        if margin     and margin > 0.10:         score += 1
+        if rev_growth and rev_growth > 0:        score += 1
 
-    trading_days = close.index
-    # סריקה פעמיים בשנה: פברואר ואוגוסט
-    scan_dates = pd.DatetimeIndex([
-        d for d in pd.date_range(BACKTEST_START, DATA_END, freq="MS")
-        if d.month in [2, 8]
-    ])
+        if score < 4:
+            return None
 
-    all_trades   = []
-    open_tickers = set()
+        # ─── שווי הוגן ──────────────────────────────────────────────
+        fair_value, margin_safety = calc_fair_value(info)
 
-    for scan_date in scan_dates:
-        idx = trading_days.searchsorted(scan_date, side="left")
-        if idx >= len(trading_days):
-            break
-        today = trading_days[idx]
+        # פסילה: מניה יקרה ביותר מ-10% מעל שווי הוגן
+        if fair_value > 0 and margin_safety < -10:
+            return None
 
-        # ─── סגור פוזיציות שהגיעו לסיום ────────────────────────────
-        still_open = set()
-        for tr in all_trades:
-            if tr["exit_date"] is not None:
-                continue
-            t       = tr["ticker"]
-            entry_p = tr["entry"]
-            entry_d = tr["entry_date"]
+        # ─── דירוג ──────────────────────────────────────────────────
+        if score == 7 and margin_safety >= 30:
+            status = "🏆 Buffett Buy"
+        elif score >= 6 and margin_safety >= 20:
+            status = "💎 מצוין"
+        elif score >= 5:
+            status = "✅ מעניין"
+        else:
+            status = "👀 לעקוב"
 
-            if t not in close.columns:
-                continue
+        return {
+            "סימול":           ticker,
+            "שם":              name,
+            "סקטור":           sector,
+            "מחיר":            round(price, 2),
+            "שווי הוגן":       fair_value if fair_value > 0 else "—",
+            "מרווח ביטחון %":  margin_safety if fair_value > 0 else "—",
+            "ציון (0-7)":      score,
+            "מצב":             status,
+            "P/E":             round(pe, 1)          if pe          else "—",
+            "P/B":             round(pb, 2)          if pb          else "—",
+            "ROE %":           round(roe * 100, 1)   if roe         else "—",
+            "חוב/הון %":       round(debt_equity, 0) if debt_equity is not None else "—",
+            "FCF ($B)":        round(fcf / 1e9, 2)   if fcf         else "—",
+            "מרג׳ין %":       round(margin * 100, 1) if margin      else "—",
+            "צמיחה %":         round(rev_growth * 100, 1) if rev_growth else "—",
+            "דיבידנד %":       round(div_yield * 100, 2)  if div_yield  else 0,
+            "שווי שוק ($B)":   round(market_cap / 1e9, 1),
+        }
 
-            cur       = float(close.loc[today, t]) if today in close.index else entry_p
-            days_held = (today - entry_d).days
-            fv        = float(fair_value.loc[today, t]) if t in fair_value.columns else 0
-
-            # מכירה: הגיע לשווי הוגן
-            hit_fair  = fv > 0 and cur >= fv * (1 - margin_sell / 100)
-            # מכירה: עבר זמן מקסימלי
-            hit_time  = days_held >= max_hold_days
-
-            if hit_fair or hit_time:
-                raw_ret = (cur / entry_p) - 1
-                if abs(raw_ret) > 0.80:
-                    raw_ret = 0.0
-                tr["exit_date"]  = today
-                tr["exit_price"] = round(cur, 2)
-                tr["ret"]        = round(raw_ret, 4)
-                tr["reason"]     = "🎯 שווי הוגן" if hit_fair else "⏱ זמן"
-            else:
-                still_open.add(t)
-
-        open_tickers = still_open
-
-        if len(open_tickers) >= max_pos:
-            continue
-
-        # ─── חפש מניות ערך ──────────────────────────────────────────
-        candidates = []
-        for t in pe_hist.columns:
-            if t in open_tickers or t not in close.columns:
-                continue
-            if today not in pe_hist.index:
-                continue
-            try:
-                pe  = float(pe_hist.loc[today, t])
-                pb  = float(pb_hist.loc[today, t])
-                fv  = float(fair_value.loc[today, t]) if t in fair_value.columns else 0
-                cur = float(close.loc[today, t])
-
-                if np.isnan(pe) or np.isnan(pb) or pe <= 0 or pb <= 0:
-                    continue
-                if pe > pe_thresh or pb > pb_thresh:
-                    continue
-                if fv <= 0 or cur <= 0:
-                    continue
-
-                margin = (fv - cur) / fv * 100
-                if margin < margin_buy:
-                    continue
-
-                candidates.append((t, margin))
-            except Exception:
-                continue
-
-        # מיון לפי מרווח ביטחון — הגדול ביותר קודם
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        slots = max_pos - len(open_tickers)
-
-        for t, margin in candidates[:slots]:
-            entry_p = float(close.loc[today, t])
-            all_trades.append({
-                "ticker":     t,
-                "entry_date": today,
-                "entry":      round(entry_p, 2),
-                "exit_date":  None,
-                "exit_price": None,
-                "ret":        None,
-                "reason":     None,
-                "margin_at_entry": round(margin, 1),
-            })
-            open_tickers.add(t)
-
-    # ─── סגור פוזיציות פתוחות ───────────────────────────────────────
-    for tr in all_trades:
-        if tr["exit_date"] is None:
-            t = tr["ticker"]
-            if t in close.columns:
-                cur     = float(close.iloc[-1][t])
-                raw_ret = (cur / tr["entry"]) - 1
-                if abs(raw_ret) > 0.80:
-                    raw_ret = 0.0
-                tr["exit_date"]  = trading_days[-1]
-                tr["exit_price"] = round(cur, 2)
-                tr["ret"]        = round(raw_ret, 4)
-                tr["reason"]     = "📅 סוף בדיקה"
-
-    closed = [tr for tr in all_trades if tr["ret"] is not None]
-    if not closed:
-        return pd.Series(dtype=float), pd.DataFrame()
-
-    # ─── עקומת הון ──────────────────────────────────────────────────
-    equity = pd.Series(
-        1.0, index=trading_days[trading_days >= pd.Timestamp(BACKTEST_START)]
-    )
-    for tr in closed:
-        e_idx = trading_days.searchsorted(tr["entry_date"])
-        x_idx = trading_days.searchsorted(tr["exit_date"])
-        if e_idx >= len(trading_days) or x_idx >= len(trading_days):
-            continue
-        weight       = 1.0 / max_pos
-        contribution = weight * tr["ret"]
-        exit_day     = trading_days[x_idx]
-        equity[equity.index >= exit_day] += contribution
-
-    log_df = pd.DataFrame([{
-        "כניסה":         tr["entry_date"].strftime("%Y-%m-%d"),
-        "יציאה":         tr["exit_date"].strftime("%Y-%m-%d"),
-        "סימול":         tr["ticker"],
-        "מחיר כניסה":   tr["entry"],
-        "מחיר יציאה":   tr["exit_price"],
-        "מרווח בכניסה %": tr["margin_at_entry"],
-        "תשואה %":       round(tr["ret"] * 100, 2),
-        "סיבת יציאה":   tr["reason"],
-    } for tr in closed]).sort_values("כניסה")
-
-    return equity, log_df
+    except Exception as e:
+        logger.warning(f"{ticker}: {e}")
+        return None
 
 
 # ─── ממשק ──────────────────────────────────────────────────────────────────
-c1, c2, c3, c4, c5 = st.columns(5)
-pe_thresh_ui    = c1.slider("P/E מקסימלי לקנייה", 8,  20, 15)
-pb_thresh_ui    = c2.slider("P/B מקסימלי לקנייה", 1,  4,  2)
-margin_buy_ui   = c3.slider("מרווח ביטחון מינימלי %", 10, 50, 25)
-margin_sell_ui  = c4.slider("מרווח מכירה (קרבה לשווי) %", 0, 15, 5)
-max_pos_ui      = c5.slider("פוזיציות במקביל", 5, 20, 10)
-max_hold_years  = st.slider("החזקה מקסימלית (שנים)", 1, 5, 2)
+c1, c2 = st.columns(2)
+min_score_ui  = c1.slider("ציון מינימלי (מתוך 7)", 4, 7, 5)
+min_margin_ui = c2.slider("מרווח ביטחון מינימלי %", 0, 50, 20)
+st.info("⏳ הסריקה לוקחת כ-8 דקות ל-600 מניות — כוס קפה מומלצת ☕")
 st.divider()
 
-if st.button("▶️ הרץ Backtest ערך", type="primary"):
-
-    tickers = get_tickers()
-    st.info(f"מוריד נתונים ל-{len(tickers)} מניות...")
-
-    close        = download_prices(tickers)
-    score_tickers = [t for t in close.columns if t != "SPY"]
-
-    fundamentals = get_fundamentals(score_tickers)
-    if fundamentals.empty:
-        st.error("לא הצלחתי לטעון נתונים פונדמנטליים.")
-        st.stop()
-
-    st.success(f"נטענו נתונים ל-{len(fundamentals)} מניות")
-
-    with st.spinner("מחשב יחסים היסטוריים..."):
-        valid_tickers = list(fundamentals.index)
-        pe_hist, pb_hist = compute_historical_ratios(close, fundamentals)
-        fair_value       = compute_fair_value(close, fundamentals)
-
-    with st.spinner("מריץ Backtest..."):
-        equity, log = run_backtest(
-            close[valid_tickers], pe_hist, pb_hist, fair_value,
-            pe_thresh_ui, pb_thresh_ui,
-            margin_buy_ui, margin_sell_ui,
-            max_hold_years * 252, max_pos_ui,
-        )
-
-    if equity.empty:
-        st.warning("לא נמצאו עסקאות. נסה להוריד את הסף.")
-        st.stop()
-
-    # ─── SPY ────────────────────────────────────────────────────────
-    spy      = close["SPY"].dropna()
-    spy_bt   = spy[spy.index >= equity.index[0]]
-    spy_norm = spy_bt / spy_bt.iloc[0]
-
-    # ─── מדדים ──────────────────────────────────────────────────────
-    port_ret = equity.iloc[-1] - 1
-    spy_ret  = spy_norm.iloc[-1] - 1
-    rets     = equity.pct_change().dropna()
-    sharpe   = (rets.mean() / rets.std() * np.sqrt(252)) if rets.std() > 0 else 0
-    max_dd   = ((equity / equity.cummax()) - 1).min()
-
-    win_rate = avg_win = avg_loss = rr = 0
-    if not log.empty:
-        win_rate = (log["תשואה %"] > 0).mean() * 100
-        wins     = log.loc[log["תשואה %"] > 0, "תשואה %"]
-        losses   = log.loc[log["תשואה %"] < 0, "תשואה %"]
-        avg_win  = wins.mean()  if not wins.empty  else 0
-        avg_loss = losses.mean() if not losses.empty else 0
-        rr       = abs(avg_win / avg_loss) if avg_loss != 0 else 0
-
-    # ─── גרף ────────────────────────────────────────────────────────
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=equity.index, y=equity.values,
-        name="Value Strategy",
-        line=dict(color="#FFD700", width=2.5)
-    ))
-    fig.add_trace(go.Scatter(
-        x=spy_norm.index, y=spy_norm.values,
-        name="S&P 500 (SPY)",
-        line=dict(color="#2196F3", width=2, dash="dot")
-    ))
-    fig.update_layout(
-        title="Value Strategy vs S&P 500 — 10 שנים",
-        yaxis_title="ערך (1.0 = נקודת פתיחה)",
-        yaxis_tickformat=".0%",
-        hovermode="x unified",
-        template="plotly_dark",
-        height=480,
+# ─── התראת יציאה ───────────────────────────────────────────────────────────
+st.subheader("🔔 בדוק מניות קיימות — האם הגיע זמן למכור?")
+with st.expander("הכנס מניות שברשותך"):
+    portfolio_input = st.text_input(
+        "סימולים מופרדים בפסיק (לדוגמה: AAPL, KO, JPM)",
+        placeholder="AAPL, KO, JPM"
     )
-    st.plotly_chart(fig, use_container_width=True)
+    if st.button("🔍 בדוק פורטפוליו", key="check_portfolio"):
+        if portfolio_input:
+            portfolio_tickers = [t.strip().upper() for t in portfolio_input.split(",") if t.strip()]
+            port_results = []
+            with st.spinner("בודק..."):
+                for t in portfolio_tickers:
+                    res = analyze_ticker(t)
+                    if res:
+                        margin = res["מרווח ביטחון %"]
+                        if isinstance(margin, (int, float)):
+                            if margin < 5:
+                                action = "🔴 מכור — הגיע לשווי הוגן"
+                            elif margin < 15:
+                                action = "🟡 שקול מכירה חלקית"
+                            else:
+                                action = "🟢 החזק"
+                        else:
+                            action = "⚪ אין מספיק נתונים"
+                        port_results.append({
+                            "סימול":           t,
+                            "מחיר":            res["מחיר"],
+                            "שווי הוגן":       res["שווי הוגן"],
+                            "מרווח ביטחון %":  res["מרווח ביטחון %"],
+                            "ציון (0-7)":      res["ציון (0-7)"],
+                            "המלצה":           action,
+                        })
+                    else:
+                        port_results.append({
+                            "סימול": t, "מחיר": "—", "שווי הוגן": "—",
+                            "מרווח ביטחון %": "—", "ציון (0-7)": "—",
+                            "המלצה": "⚪ לא נמצא",
+                        })
+            st.dataframe(pd.DataFrame(port_results), use_container_width=True)
+        else:
+            st.warning("הכנס לפחות סימול אחד.")
 
-    m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
-    m1.metric("תשואה כוללת",  f"{port_ret*100:.0f}%",
-              delta=f"{(port_ret-spy_ret)*100:.0f}% vs SPY")
-    m2.metric("SPY",           f"{spy_ret*100:.0f}%")
-    m3.metric("Sharpe",        f"{sharpe:.2f}")
-    m4.metric("Max Drawdown",  f"{max_dd*100:.1f}%")
-    m5.metric("Win Rate",      f"{win_rate:.0f}%")
-    m6.metric("יחס R:R",       f"{rr:.1f}")
-    m7.metric("עסקאות",        len(log))
+st.divider()
 
-    exit_reasons = log["סיבת יציאה"].value_counts()
-    st.caption(" | ".join([f"{k}: {v}" for k, v in exit_reasons.items()]))
+if st.button("🔍 סרוק מניות ערך", type="primary"):
 
-    st.divider()
-    with st.expander("📋 לוג כל העסקאות"):
-        st.dataframe(log, use_container_width=True)
+    get_tickers.clear()
+    tickers       = get_tickers()
+    total_tickers = len(tickers)
 
-    csv = log.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("📥 ייצא לוג", csv,
-                       f"value_backtest_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv")
+    st.info(f"סורק {total_tickers} מניות (S&P 500 + נאסד\"ק)...")
+
+    bar         = st.progress(0)
+    status      = st.empty()
+    all_results = []
+    scanned     = 0
+    total_batches = (total_tickers + BATCH_SIZE - 1) // BATCH_SIZE
+
+    for i, start in enumerate(range(0, total_tickers, BATCH_SIZE)):
+        batch = tickers[start : start + BATCH_SIZE]
+        for t in batch:
+            res = analyze_ticker(t)
+            if res:
+                all_results.append(res)
+            scanned += 1
+
+        bar.progress(scanned / total_tickers)
+        status.text(f"סרוקו: {scanned}/{total_tickers} | נמצאו: {len(all_results)}")
+        if i < total_batches - 1:
+            time.sleep(SLEEP)
+
+    bar.empty()
+    status.empty()
+
+    if not all_results:
+        st.warning("לא נמצאו מניות. נסה להוריד את הסף.")
+        st.stop()
+
+    df_all = pd.DataFrame(all_results)
+
+    # סינון לפי ציון ומרווח ביטחון
+    df_out = df_all[
+        (df_all["ציון (0-7)"] >= min_score_ui) &
+        (df_all["מרווח ביטחון %"].apply(lambda x: x >= min_margin_ui if isinstance(x, (int, float)) else False))
+    ].sort_values(
+        ["ציון (0-7)", "מרווח ביטחון %"], ascending=[False, False]
+    ).reset_index(drop=True)
+    df_out.index += 1
+
+    st.success(
+        f"✅ נסרקו {total_tickers} מניות | "
+        f"נמצאו **{len(df_out)}** מניות ערך עם מרווח ביטחון ≥ {min_margin_ui}%"
+    )
+
+    # ─── פירוט לפי דירוג ────────────────────────────────────────────
+    for status_label in ["🏆 Buffett Buy", "💎 מצוין", "✅ מעניין", "👀 לעקוב"]:
+        sub = df_out[df_out["מצב"] == status_label]
+        if sub.empty:
+            continue
+        if status_label in ["🏆 Buffett Buy", "💎 מצוין"]:
+            st.subheader(f"{status_label} ({len(sub)} מניות)")
+            st.dataframe(sub, use_container_width=True)
+        else:
+            with st.expander(f"{status_label} ({len(sub)} מניות)"):
+                st.dataframe(sub, use_container_width=True)
+
+    csv = df_out.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "📥 ייצא CSV",
+        csv,
+        f"value_{datetime.now().strftime('%Y%m%d')}.csv",
+        "text/csv",
+    )
