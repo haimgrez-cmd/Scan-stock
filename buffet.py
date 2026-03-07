@@ -75,16 +75,30 @@ def get_tickers() -> list[str]:
 # ─── שווי הוגן ─────────────────────────────────────────────────────────────
 # P/E הוגן לפי סקטור — מבוסס על ממוצעים היסטוריים
 SECTOR_PE = {
-    "Technology": 25, "Healthcare": 20, "Financial Services": 14,
-    "Consumer Defensive": 18, "Consumer Cyclical": 16, "Industrials": 17,
-    "Energy": 12, "Utilities": 15, "Real Estate": 20,
-    "Communication Services": 20, "Basic Materials": 14,
+    "Technology": 25,             # טכנולוגיה — צמיחה גבוהה
+    "Healthcare": 18,             # בריאות — יציב
+    "Financial Services": 12,     # פיננסים/ביטוח — מכפיל נמוך מטבעו
+    "Consumer Defensive": 17,     # צריכה בסיסית — יציב
+    "Consumer Cyclical": 15,      # צריכה מחזורית
+    "Industrials": 16,            # תעשייה
+    "Energy": 11,                 # אנרגיה — מחזורי
+    "Utilities": 14,              # תשתיות — ריבית-תלוי
+    "Real Estate": 18,            # נדל"ן — לפי FFO
+    "Communication Services": 18, # תקשורת
+    "Basic Materials": 13,        # חומרי גלם
 }
 SECTOR_PB = {
-    "Technology": 5, "Healthcare": 4, "Financial Services": 1.5,
-    "Consumer Defensive": 4, "Consumer Cyclical": 3, "Industrials": 3,
-    "Energy": 1.5, "Utilities": 1.5, "Real Estate": 2,
-    "Communication Services": 3, "Basic Materials": 2,
+    "Technology": 6,              # נכסים בלתי מוחשיים גבוהים
+    "Healthcare": 4,
+    "Financial Services": 1.2,    # ביטוח/בנקים — P/B נמוך נורמלי
+    "Consumer Defensive": 4,
+    "Consumer Cyclical": 2.5,
+    "Industrials": 2.5,
+    "Energy": 1.5,
+    "Utilities": 1.3,
+    "Real Estate": 1.8,
+    "Communication Services": 2.5,
+    "Basic Materials": 1.8,
 }
 
 def calc_fair_value(info: dict) -> tuple[float, float]:
