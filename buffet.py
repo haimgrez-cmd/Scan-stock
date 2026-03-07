@@ -141,7 +141,16 @@ def calc_fair_value(info: dict) -> tuple[float, float]:
     if not estimates or price <= 0:
         return 0.0, 0.0
 
-    fair_value    = float(np.mean(estimates))
+    # DCF מקבל משקל נמוך יותר כי הוא רגיש מאוד להנחות
+    # P/E ו-P/B מקבלים משקל גבוה יותר כי הם מבוססי סקטור
+    if len(estimates) == 3:
+        # P/E × 0.4 + P/B × 0.4 + DCF × 0.2
+        fair_value = estimates[0] * 0.4 + estimates[1] * 0.4 + estimates[2] * 0.2
+    elif len(estimates) == 2:
+        fair_value = float(np.mean(estimates))
+    else:
+        fair_value = float(estimates[0])
+
     margin_safety = (fair_value - price) / fair_value * 100
 
     return round(fair_value, 2), round(margin_safety, 1)
