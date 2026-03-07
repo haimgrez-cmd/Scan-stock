@@ -144,10 +144,10 @@ def calc_fair_value(info: dict) -> tuple[float, float]:
     # DCF מקבל משקל נמוך יותר כי הוא רגיש מאוד להנחות
     # P/E ו-P/B מקבלים משקל גבוה יותר כי הם מבוססי סקטור
     if len(estimates) == 3:
-        # P/E × 0.4 + P/B × 0.4 + DCF × 0.2
-        fair_value = estimates[0] * 0.4 + estimates[1] * 0.4 + estimates[2] * 0.2
+        # P/E × 0.5 + P/B × 0.5 — ללא DCF
+        fair_value = estimates[0] * 0.5 + estimates[1] * 0.5
     elif len(estimates) == 2:
-        fair_value = float(np.mean(estimates))
+        fair_value = estimates[0] * 0.5 + estimates[1] * 0.5
     else:
         fair_value = float(estimates[0])
 
