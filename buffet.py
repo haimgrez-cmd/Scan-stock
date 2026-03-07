@@ -101,59 +101,7 @@ SECTOR_PB = {
     "Basic Materials": 1.8,
 }
 
-def calc_fair_value(info: dict) -> tuple[float, float]:
-    """
-    מחזיר (שווי_הוגן, מרווח_ביטחון_%).
-    משתמש בממוצע עד 3 מודלים לפי זמינות הנתונים.
-    """
-    sector   = info.get("sector", "")
-    price    = info.get("currentPrice") or info.get("regularMarketPrice") or 0
-    eps      = info.get("trailingEps")
-    bvps     = info.get("bookValue")
-    fcf      = info.get("freeCashflow")
-    shares   = info.get("sharesOutstanding")
-    growth   = info.get("revenueGrowth") or 0.05
 
-    fair_pe  = SECTOR_PE.get(sector, 15)
-    fair_pb  = SECTOR_PB.get(sector, 2)
-
-    estimates = []
-
-    # מודל 1: P/E הוגן
-    if eps and eps > 0:
-        estimates.append(eps * fair_pe)
-
-    # מודל 2: P/B הוגן
-    if bvps and bvps > 0:
-        estimates.append(bvps * fair_pb)
-
-    # מודל 3: DCF פשוט
-    if fcf and shares and shares > 0 and fcf > 0:
-        fcf_per_share = fcf / shares
-        discount_rate = 0.10
-        g             = min(max(growth, 0.02), 0.15)  # מגביל בין 2% ל-15%
-        # סכום FCF 10 שנים + ערך שייר
-        dcf = sum(fcf_per_share * (1 + g) ** yr / (1 + discount_rate) ** yr
-                  for yr in range(1, 11))
-        dcf += (fcf_per_share * (1 + g) ** 10 / (discount_rate - 0.03)) / (1 + discount_rate) ** 10
-        estimates.append(dcf)
-
-    if not estimates or price <= 0:
-        return 0.0, 0.0
-
-    # DCF מקבל משקל נמוך יותר כי הוא רגיש מאוד להנחות
-    # P/E ו-P/B מקבלים משקל גבוה יותר כי הם מבוססי סקטור
-    if len(estimates) == 3:
-        # P/E × 0.5 + P/B × 0.5 — ללא DCF
-        fair_value = estimates[0] * 0.5 + estimates[1] * 0.5
-    elif len(estimates) == 2:
-        fair_value = estimates[0] * 0.5 + estimates[1] * 0.5
-    else:
-        fair_value = float(estimates[0])
-
-    margin_safety = (fair_value - price) / fair_value * 100
-
-    return round(fair_value, 2), round(margin_safety, 1)
 
 
 # ─── ניתוח מניה ────────────────────────────────────────────────────────────
@@ -194,42 +142,7 @@ def analyze_ticker(ticker: str) -> dict | None:
         if score < 4:
             return None
 
-        # ─── שווי הוגן ──────────────────────────────────────────────
-        fair_value, margin_safety = calc_fair_value(info)
-
-        # פסילה: מניה יקרה ביותר מ-10% מעל שווי הוגן
-        if fair_value > 0 and margin_safety < -10:
-            return None
-
-        # ─── דירוג ──────────────────────────────────────────────────
-        if score == 7 and margin_safety >= 30:
-            status = "🏆 Buffett Buy"
-        elif score >= 6 and margin_safety >= 20:
-            status = "💎 מצוין"
-        elif score >= 5:
-            status = "✅ מעניין"
-        else:
-            status = "👀 לעקוב"
-
-        return {
-            "סימול":           ticker,
-            "שם":              name,
-            "סקטור":           sector,
-            "מחיר":            round(price, 2),
-            "שווי הוגן":       fair_value if fair_value > 0 else "—",
-            "מרווח ביטחון %":  margin_safety if fair_value > 0 else "—",
-            "ציון (0-7)":      score,
-            "מצב":             status,
-            "P/E":             round(pe, 1)          if pe          else "—",
-            "P/B":             round(pb, 2)          if pb          else "—",
-            "ROE %":           round(roe * 100, 1)   if roe         else "—",
-            "חוב/הון %":       round(debt_equity, 0) if debt_equity is not None else "—",
-            "FCF ($B)":        round(fcf / 1e9, 2)   if fcf         else "—",
-            "מרג׳ין %":       round(margin * 100, 1) if margin      else "—",
-            "צמיחה %":         round(rev_growth * 100, 1) if rev_growth else "—",
-            "דיבידנד %":       round(div_yield * 100, 2)  if div_yield  else 0,
-            "שווי שוק ($B)":   round(market_cap / 1e9, 1),
-        }
+        # ─── דירוג 
 
     except Exception as e:
         logger.warning(f"{ticker}: {e}")
