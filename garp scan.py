@@ -9,10 +9,11 @@ from datetime import datetime
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
-st.set_page_config(page_title="סורק GARP", layout="wide")
-st.title("🚀 סורק GARP — Growth At a Reasonable Price")
+st.set_page_config(page_title="סורק VCP+GARP", layout="wide")
+st.title("🎯 סורק VCP + GARP — מניות לפני פריצה")
 st.caption(
-    "Peter Lynch Style | מומנטום מחירים + איכות עסק | "
+    "שלב 1: פילטר איכות עסק | "
+    "שלב 2: בסיס טכני VCP | "
     f"עדכון: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
 )
 
@@ -22,20 +23,22 @@ SLEEP       = 1.0
 
 with st.expander("ℹ️ איך זה עובד?"):
     st.markdown("""
-    **שני שלבים:**
+    **3 שלבים:**
     
-    **שלב 1 — פילטר איכות עסק** (yfinance — נתונים נוכחיים בלבד, לא שווי הוגן):
-    - ROE > 15% — החברה מרוויחה טוב על ההון
-    - FCF חיובי — מכניסה כסף אמיתי
-    - חוב/הון < 150% — לא ממונפת יתר
-    - מרג'ין > 8% — עסק רווחי
+    **שלב 1 — איכות עסק:**
+    - ROE > 15% | FCF חיובי | מרג'ין > 8% | חוב סביר
     
-    **שלב 2 — מומנטום מחירים** (אמין לחלוטין):
-    - ממוצעים מדורגים SMA50 > SMA100 > SMA200
-    - ROC חיובי בכל הטווחים
-    - ציון משוקלל: ROC 6M × 0.5 + ROC 12M × 0.3 + ROC 3M × 0.2
+    **שלב 2 — טרנד ראשי עולה:**
+    - מחיר מעל SMA200 | ממוצעים מדורגים SMA50 > SMA100 > SMA200
+    - קרובה לשיא 52 שבועות (מקסימום 25% מתחת)
     
-    **הרעיון:** עסק טוב שגם נמצא בטרנד עולה.
+    **שלב 3 — VCP (Volatility Contraction Pattern):**
+    - תנודתיות מתכווצת — ATR 20 יום קטן מ-ATR 60 יום
+    - בסיס צר — טווח מחיר < 15% ב-20 ימים
+    - ווליום מתכווץ — ווליום נמוך מהרגיל = כסף חכם לא מוכר
+    - RSI בטווח 40-70 — לא oversold ולא overbought
+    
+    **ציון 5** = מוכנה לפריצה | **קרובה לשיא + בסיס צר** = כניסה אידיאלית
     """)
 
 
@@ -65,44 +68,27 @@ def get_tickers() -> list[str]:
     ]
 
 
-# ─── RSI ───────────────────────────────────────────────────────────────────
-def calc_rsi(s: pd.Series, n: int = 14) -> float:
-    d = s.diff().dropna()
-    if len(d) < n:
-        return 50.0
-    g  = d.clip(lower=0).ewm(com=n - 1, adjust=False).mean()
-    l  = (-d.clip(upper=0)).ewm(com=n - 1, adjust=False).mean()
-    ll = l.iloc[-1]
-    return 100.0 if ll == 0 else float(100 - 100 / (1 + g.iloc[-1] / ll))
-
-
-# ─── פילטר איכות עסק ────────────────────────────────────────────────────────
+# ─── פילטר איכות ───────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def get_quality_tickers(tickers: list[str]) -> set[str]:
-    """
-    מחזיר רק מניות שעוברות פילטר איכות בסיסי.
-    משתמש בנתונים נוכחיים בלבד — לא מחשב שווי הוגן.
-    """
     quality = set()
     prog    = st.progress(0)
     status  = st.empty()
 
     for i, t in enumerate(tickers):
         try:
-            info     = yf.Ticker(t).info
-            roe      = info.get("returnOnEquity")
-            fcf      = info.get("freeCashflow")
-            debt_eq  = info.get("debtToEquity")
-            margin   = info.get("profitMargins")
-            sector   = info.get("sector", "")
+            info    = yf.Ticker(t).info
+            roe     = info.get("returnOnEquity")
+            fcf     = info.get("freeCashflow")
+            margin  = info.get("profitMargins")
+            debt_eq = info.get("debtToEquity")
 
-            # פילטר בסיסי — רק 4 קריטריונים פשוטים
             if not all([roe, fcf, margin]):
                 continue
-            if roe   < 0.15:  continue   # ROE > 15%
-            if fcf   < 0:     continue   # FCF חיובי
-            if margin < 0.08: continue   # מרג'ין > 8%
-            if debt_eq and debt_eq > 150: continue  # חוב סביר
+            if roe    < 0.15:  continue
+            if fcf    < 0:     continue
+            if margin < 0.08:  continue
+            if debt_eq and debt_eq > 150: continue
 
             quality.add(t)
         except Exception:
@@ -116,60 +102,101 @@ def get_quality_tickers(tickers: list[str]) -> set[str]:
     return quality
 
 
-# ─── ציון מומנטום ───────────────────────────────────────────────────────────
-def calc_momentum(ticker: str, df: pd.DataFrame) -> dict | None:
+# ─── RSI ───────────────────────────────────────────────────────────────────
+def calc_rsi(s: pd.Series, n: int = 14) -> float:
+    d = s.diff().dropna()
+    if len(d) < n:
+        return 50.0
+    g  = d.clip(lower=0).ewm(com=n - 1, adjust=False).mean()
+    l  = (-d.clip(upper=0)).ewm(com=n - 1, adjust=False).mean()
+    ll = l.iloc[-1]
+    return 100.0 if ll == 0 else float(100 - 100 / (1 + g.iloc[-1] / ll))
+
+
+# ─── זיהוי VCP ─────────────────────────────────────────────────────────────
+def detect_vcp(ticker: str, df: pd.DataFrame) -> dict | None:
     try:
-        df = df[["Close", "Volume"]].dropna()
-        if len(df) < 252:
+        df = df[["Close", "High", "Low", "Volume"]].dropna()
+        if len(df) < 200:
             return None
 
         c = df["Close"].astype(float)
+        h = df["High"].astype(float)
+        l = df["Low"].astype(float)
         v = df["Volume"].astype(float)
 
-        last    = c.iloc[-1]
-        avg_vol = v.tail(20).mean()
+        last    = float(c.iloc[-1])
+        avg_vol = float(v.tail(20).mean())
 
-        if last < 5 or avg_vol < 500_000:
+        if last < 10 or avg_vol < 500_000:
             return None
 
+        # ─── טרנד ראשי ──────────────────────────────────────────────
         sma50  = float(c.iloc[-50:].mean())
-        sma100 = float(c.iloc[-100:].mean())
+        sma100 = float(c.iloc[-100:].mean()) if len(c) >= 100 else np.nan
         sma200 = float(c.iloc[-200:].mean())
 
         if any(np.isnan(x) for x in [sma50, sma100, sma200]):
             return None
-        if not (sma50 > sma100 > sma200): return None
         if last < sma200:                 return None
+        if not (sma50 > sma100 > sma200): return None
 
-        roc3  = float(c.pct_change(63).iloc[-1])  * 100
-        roc6  = float(c.pct_change(126).iloc[-1]) * 100
-        roc12 = float(c.pct_change(252).iloc[-1]) * 100
+        # ─── קרבה לשיא 52 שבועות ────────────────────────────────────
+        high_52w      = float(h.iloc[-252:].max()) if len(h) >= 252 else float(h.max())
+        pct_from_high = (high_52w - last) / high_52w * 100
+        if pct_from_high > 25: return None
 
-        if any(np.isnan(x) for x in [roc3, roc6, roc12]): return None
-        if roc3 < 0 or roc6 < 0 or roc12 < 0:             return None
+        # ─── כיווץ תנודתיות ──────────────────────────────────────────
+        atr20 = float((h.iloc[-20:] - l.iloc[-20:]).mean())
+        atr60 = float((h.iloc[-60:] - l.iloc[-60:]).mean())
+        if atr60 == 0:          return None
+        atr_ratio = atr20 / atr60
+        if atr_ratio > 0.80:    return None
 
+        # ─── בסיס צר ─────────────────────────────────────────────────
+        recent_high = float(h.iloc[-20:].max())
+        recent_low  = float(l.iloc[-20:].min())
+        if recent_low == 0:     return None
+        base_width = (recent_high - recent_low) / recent_low * 100
+        if base_width > 15:     return None
+
+        # ─── ווליום מתכווץ ────────────────────────────────────────────
+        vol_recent = float(v.iloc[-20:].mean())
+        vol_prior  = float(v.iloc[-60:-20].mean())
+        if vol_prior == 0:      return None
+        vol_ratio = vol_recent / vol_prior
+        if vol_ratio > 0.85:    return None
+
+        # ─── RSI ─────────────────────────────────────────────────────
         rsi = calc_rsi(c)
-        if rsi > 75: return None
+        if rsi < 40 or rsi > 70: return None
 
-        vol20     = float(v.iloc[-20:].mean())
-        vol50     = float(v.iloc[-50:].mean())
-        vol_bonus = 5.0 if (vol50 > 0 and vol20 > vol50 * 1.2) else 0.0
+        # ─── ציון VCP (0-5) ──────────────────────────────────────────
+        score = 0
+        if atr_ratio    < 0.65:  score += 1   # כיווץ חזק מאוד
+        if base_width   < 8:     score += 1   # בסיס צר מאוד
+        if vol_ratio    < 0.65:  score += 1   # ווליום ירד הרבה
+        if pct_from_high < 10:   score += 1   # קרוב מאוד לשיא
+        if 50 < rsi < 65:        score += 1   # RSI אידיאלי
 
-        score = (roc6 * 0.5) + (roc12 * 0.3) + (roc3 * 0.2) + vol_bonus
-
-        if score <= 0:
+        if score < 2:
             return None
 
+        # ROC 6M לדירוג
+        roc6 = float(c.pct_change(126).iloc[-1] * 100) if len(c) >= 126 else 0.0
+
         return {
-            "סימול":     ticker,
-            "מחיר":      round(float(last), 2),
-            "ציון":      round(float(score), 1),
-            "ROC 3M %":  round(roc3,  1),
-            "ROC 6M %":  round(roc6,  1),
-            "ROC 12M %": round(roc12, 1),
-            "RSI":       round(rsi,   1),
-            "SMA50":     round(sma50,  2),
-            "SMA200":    round(sma200, 2),
+            "סימול":          ticker,
+            "מחיר":           round(last, 2),
+            "ציון VCP":       score,
+            "% משיא 52W":     round(pct_from_high, 1),
+            "רוחב בסיס %":    round(base_width, 1),
+            "כיווץ ATR":      round(atr_ratio, 2),
+            "כיווץ ווליום":   round(vol_ratio, 2),
+            "RSI":            round(rsi, 1),
+            "ROC 6M %":       round(roc6, 1),
+            "שיא 52W":        round(high_52w, 2),
+            "SMA200":         round(sma200, 2),
         }
 
     except Exception as e:
@@ -177,7 +204,7 @@ def calc_momentum(ticker: str, df: pd.DataFrame) -> dict | None:
         return None
 
 
-# ─── batch מומנטום ──────────────────────────────────────────────────────────
+# ─── batch ─────────────────────────────────────────────────────────────────
 def analyze_batch(tickers: list[str]) -> list[dict]:
     if not tickers:
         return []
@@ -197,7 +224,7 @@ def analyze_batch(tickers: list[str]) -> list[dict]:
     for t in tickers:
         try:
             df  = raw[t].copy() if is_multi else raw.copy()
-            res = calc_momentum(t, df)
+            res = detect_vcp(t, df)
             if res:
                 results.append(res)
         except Exception as e:
@@ -207,20 +234,20 @@ def analyze_batch(tickers: list[str]) -> list[dict]:
 
 
 # ─── ממשק ──────────────────────────────────────────────────────────────────
-top_n_ui = st.slider("כמה מניות להציג (Top N)", 3, 10, 5)
 st.info(
-    "⏳ שני שלבים: פילטר איכות (~5 דקות) + מומנטום (~2 דקות)\n\n"
-    "🗓️ הרץ בסוף כל רבעון: מרץ | יוני | ספטמבר | דצמבר"
+    "⏳ שלב 1: פילטר איכות (~5 דקות) | שלב 2: VCP (~2 דקות)\n\n"
+    "🎯 **כניסה:** כשהמניה פורצת מעל תקרת הבסיס עם ווליום גבוה פי 2+ מהרגיל\n"
+    "🛑 **Stop Loss:** מתחת לתחתית הבסיס"
 )
 st.divider()
 
-if st.button("🚀 סרוק GARP", type="primary"):
+if st.button("🎯 סרוק VCP + GARP", type="primary"):
 
     get_tickers.clear()
     tickers = get_tickers()
-    st.info(f"שלב 1: בודק איכות עסק ל-{len(tickers)} מניות...")
 
-    # שלב 1: פילטר איכות
+    # שלב 1: איכות
+    st.info(f"שלב 1: בודק איכות עסק ל-{len(tickers)} מניות...")
     quality_tickers = get_quality_tickers(tickers)
     st.success(f"✅ עברו פילטר איכות: {len(quality_tickers)} מניות")
 
@@ -228,9 +255,8 @@ if st.button("🚀 סרוק GARP", type="primary"):
         st.warning("לא נמצאו מניות איכותיות.")
         st.stop()
 
-    # שלב 2: מומנטום
-    st.info(f"שלב 2: בודק מומנטום ל-{len(quality_tickers)} מניות...")
-
+    # שלב 2: VCP
+    st.info(f"שלב 2: מחפש VCP ב-{len(quality_tickers)} מניות...")
     quality_list  = sorted(quality_tickers)
     bar           = st.progress(0)
     status        = st.empty()
@@ -243,7 +269,7 @@ if st.button("🚀 סרוק GARP", type="primary"):
         all_results.extend(analyze_batch(batch))
         scanned += len(batch)
         bar.progress(scanned / len(quality_list))
-        status.text(f"סרוקו: {scanned}/{len(quality_list)} | עברו: {len(all_results)}")
+        status.text(f"סרוקו: {scanned}/{len(quality_list)} | נמצאו VCP: {len(all_results)}")
         if i < total_batches - 1:
             time.sleep(SLEEP)
 
@@ -251,36 +277,35 @@ if st.button("🚀 סרוק GARP", type="primary"):
     status.empty()
 
     if not all_results:
-        st.warning("לא נמצאו מניות שעוברות גם איכות וגם מומנטום.")
+        st.warning("לא נמצאו מניות VCP כרגע. השוק אולי לא בשלב הנכון.")
         st.stop()
 
-    df_all = (
+    df_out = (
         pd.DataFrame(all_results)
-        .sort_values("ציון", ascending=False)
+        .sort_values(["ציון VCP", "% משיא 52W"], ascending=[False, True])
         .reset_index(drop=True)
     )
-
-    df_top = df_all.head(top_n_ui).copy()
-    df_top.index += 1
+    df_out.index += 1
 
     st.success(
         f"✅ {len(tickers)} מניות → "
         f"{len(quality_tickers)} עברו איכות → "
-        f"{len(df_all)} עברו גם מומנטום | "
-        f"מוצגות Top {top_n_ui}"
+        f"**{len(df_out)} מניות VCP** מוכנות לפריצה"
     )
 
-    st.subheader(f"🏆 Top {top_n_ui} — עסקים טובים בטרנד עולה")
-    st.dataframe(df_top, use_container_width=True)
+    # הדגש ציון 5
+    top_vcp = df_out[df_out["ציון VCP"] == 5]
+    if not top_vcp.empty:
+        st.subheader(f"⭐ ציון 5 — הכי קרובות לפריצה ({len(top_vcp)} מניות)")
+        st.dataframe(top_vcp, use_container_width=True)
 
-    with st.expander(f"📋 כל {len(df_all)} המניות שעברו"):
-        df_all.index += 1
-        st.dataframe(df_all, use_container_width=True)
+    st.subheader(f"📋 כל {len(df_out)} מניות ה-VCP")
+    st.dataframe(df_out, use_container_width=True)
 
-    csv = df_top.to_csv(index=False).encode("utf-8-sig")
+    csv = df_out.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         "📥 ייצא CSV",
         csv,
-        f"garp_top{top_n_ui}_{datetime.now().strftime('%Y%m%d')}.csv",
+        f"vcp_garp_{datetime.now().strftime('%Y%m%d')}.csv",
         "text/csv",
     )
