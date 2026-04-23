@@ -29,7 +29,7 @@ CRIT_KEYS = [
     "מעל SMA200",
     "SMA50 > SMA200",
     "קרוב לשיא (<30%)",
-    "כיווץ ATR (<0.95)",
+    "כיווץ ATR (<1.05)",
     "בסיס צר (<25%)",
     "ווליום מתכווץ (<1.0)",
     "RSI 35-75",
@@ -112,7 +112,7 @@ def check_vcp(ticker: str, check_date: str) -> dict:
         atr20 = float((h.iloc[-20:] - l.iloc[-20:]).mean())
         atr60 = float((h.iloc[-60:] - l.iloc[-60:]).mean()) if len(h) >= 60 else atr20
         atr_ratio = (atr20 / atr60) if atr60 > 0 else 1.0
-        result["כיווץ ATR (<0.95)"] = bool(atr_ratio < 0.95)
+        result["כיווץ ATR (<1.05)"] = bool(atr_ratio < 1.05)
 
         r_high = float(h.iloc[-20:].max())
         r_low  = float(l.iloc[-20:].min())
