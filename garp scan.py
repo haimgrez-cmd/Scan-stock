@@ -110,23 +110,21 @@ def check_vcp(ticker: str, check_date: str) -> dict:
         result["קרוב לשיא (<30%)"] = bool(pct_from_high < 30)
         result["% משיא"]           = round(pct_from_high, 1)
 
-        atr20 = float((h.iloc[-20:] - l.iloc[-20:]).mean())
-        atr60 = float((h.iloc[-60:] - l.iloc[-60:]).mean()) if len(h) >= 60 else atr20
-        if atr60 > 0:
-            result["כיווץ ATR (<0.95)"] = bool((atr20 / atr60) < 0.95)
+        atr_ratio = (atr20 / atr60) if atr60 > 0 else 1.0
+        result["כיווץ ATR (לציון)"] = bool(atr_ratio < 0.95)  # רק לציון
 
         r_high = float(h.iloc[-20:].max())
         r_low  = float(l.iloc[-20:].min())
         if r_low > 0:
-            result["בסיס צר (<15%)"] = bool((r_high - r_low) / r_low * 100 < 15)
+            result["בסיס צר (<25%)"] = bool((r_high - r_low) / r_low * 100 < 25)
 
         vol20 = float(v.iloc[-20:].mean())
         vol60 = float(v.iloc[-60:-20].mean()) if len(v) >= 60 else vol20
         if vol60 > 0:
-            result["ווליום מתכווץ (<0.95)"] = bool((vol20 / vol60) < 0.95)
+            result["ווליום מתכווץ (<1.0)"] = bool((vol20 / vol60) < 1.0)
 
         rsi = calc_rsi(c)
-        result["RSI 45-65"] = bool(45 < rsi < 65)
+        result["RSI 35-75"] = bool(35 < rsi < 75)
         result["RSI"]       = round(rsi, 1)
 
         # ציון
@@ -178,8 +176,8 @@ if st.button("🔬 הרץ בדיקה", type="primary"):
 
     crit_keys = [
         "מעל SMA200", "SMA50 > SMA200", "קרוב לשיא (<30%)",
-        "כיווץ ATR (<0.95)", "בסיס צר (<15%)",
-        "ווליום מתכווץ (<0.95)", "RSI 45-65"
+        "כיווץ ATR (לציון)", "בסיס צר (<25%)",
+        "ווליום מתכווץ (<1.0)", "RSI 35-75"
     ]
 
     # המר לסימנים
