@@ -103,8 +103,8 @@ def check_vcp_on_date(ticker: str, check_date: str) -> dict:
 
         if not np.isnan(sma200):
             criteria["מעל SMA200"] = last > sma200
-        if not any(np.isnan(x) for x in [sma50, sma100, sma200]):
-            criteria["ממוצעים מדורגים"] = bool(sma50 > sma100 > sma200)
+        if not any(np.isnan(x) for x in [sma50, sma200]):
+            criteria["ממוצעים מדורגים"] = bool(sma50 > sma200)  # רופף
 
         high_52w = float(h.iloc[-252:].max()) if len(h) >= 252 else float(h.max())
         pct_from_high = (high_52w - last) / high_52w * 100
@@ -113,7 +113,7 @@ def check_vcp_on_date(ticker: str, check_date: str) -> dict:
         atr20 = float((h.iloc[-20:] - l.iloc[-20:]).mean())
         atr60 = float((h.iloc[-60:] - l.iloc[-60:]).mean()) if len(h) >= 60 else atr20
         if atr60 > 0:
-            criteria["כיווץ ATR (<0.90)"] = (atr20 / atr60) < 0.90
+            criteria["כיווץ ATR (<0.95)"] = (atr20 / atr60) < 0.95
 
         recent_high = float(h.iloc[-20:].max())
         recent_low  = float(l.iloc[-20:].min())
@@ -126,7 +126,7 @@ def check_vcp_on_date(ticker: str, check_date: str) -> dict:
             criteria["ווליום מתכווץ (<0.95)"] = (vol_recent / vol_prior) < 0.95
 
         rsi = calc_rsi(c)
-        criteria["RSI 40-70"] = 40 < rsi < 70
+        criteria["RSI 45-65"] = 45 < rsi < 65
 
         result.update(criteria)
         result["ציון VCP"] = sum(criteria.values())
