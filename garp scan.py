@@ -25,8 +25,17 @@ KNOWN_BREAKOUTS = {
     "APP":   "2024-01-01",
 }
 
+CRIT_KEYS = [
+    "מעל SMA200",
+    "SMA50 > SMA200",
+    "קרוב לשיא (<30%)",
+    "כיווץ ATR (<0.95)",
+    "בסיס צר (<25%)",
+    "ווליום מתכווץ (<1.0)",
+    "RSI 35-75",
+]
 
-# ─── RSI ───────────────────────────────────────────────────────────────────
+
 def calc_rsi(s: pd.Series, n: int = 14) -> float:
     d = s.diff().dropna()
     if len(d) < n:
@@ -37,26 +46,19 @@ def calc_rsi(s: pd.Series, n: int = 14) -> float:
     return 100.0 if ll == 0 else float(100 - 100 / (1 + g.iloc[-1] / ll))
 
 
-# ─── בדיקה ─────────────────────────────────────────────────────────────────
 def check_vcp(ticker: str, check_date: str) -> dict:
     result = {
-        "סימול":            ticker,
-        "תאריך":            check_date,
-        "מחיר אז":          "—",
-        "מחיר היום":        "—",
-        "תשואה %":          "—",
-        "ציון VCP":         0,
-        "% משיא":           "—",
-        "RSI":              "—",
-        # קריטריונים — זהים לסורק
-        "מעל SMA200":                False,
-        "SMA50 > SMA200":            False,
-        "קרוב לשיא (<30%)":          False,
-        "כיווץ ATR (<0.95)":         False,
-        "בסיס צר (<15%)":            False,
-        "ווליום מתכווץ (<0.95)":     False,
-        "RSI 45-65":                 False,
+        "סימול":      ticker,
+        "תאריך":      check_date,
+        "מחיר אז":    "—",
+        "מחיר היום":  "—",
+        "תשואה %":    "—",
+        "ציון VCP":   0,
+        "% משיא":     "—",
+        "RSI":        "—",
     }
+    for k in CRIT_KEYS:
+        result[k] = False
 
     try:
         dt    = datetime.strptime(check_date, "%Y-%m-%d")
@@ -64,12 +66,9 @@ def check_vcp(ticker: str, check_date: str) -> dict:
         end   = (dt + timedelta(days=3)).strftime("%Y-%m-%d")
 
         raw = yf.download(ticker, start=start, end=end,
-                          auto_adjust=True, progress=False,
-                          group_by="column")
-
+                          auto_adjust=True, progress=False, group_by="column")
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = raw.columns.get_level_values(0)
-
         raw = raw[["Close", "High", "Low", "Volume"]].dropna()
 
         if len(raw) < 150:
@@ -97,21 +96,23 @@ def check_vcp(ticker: str, check_date: str) -> dict:
         except Exception:
             pass
 
-        # ─── קריטריונים — זהים בדיוק לסורק ─────────────────────────
+        # ─── קריטריונים ─────────────────────────────────────────────
         sma50  = float(c.iloc[-50:].mean())
         sma200 = float(c.iloc[-200:].mean()) if len(c) >= 200 else np.nan
 
         if not np.isnan(sma200):
-            result["מעל SMA200"]      = bool(last > sma200)
-            result["SMA50 > SMA200"]  = bool(sma50 > sma200)
+            result["מעל SMA200"]     = bool(last > sma200)
+            result["SMA50 > SMA200"] = bool(sma50 > sma200)
 
         high_52w      = float(h.tail(252).max()) if len(h) >= 252 else float(h.max())
         pct_from_high = (high_52w - last) / high_52w * 100
         result["קרוב לשיא (<30%)"] = bool(pct_from_high < 30)
         result["% משיא"]           = round(pct_from_high, 1)
 
+        atr20 = float((h.iloc[-20:] - l.iloc[-20:]).mean())
+        atr60 = float((h.iloc[-60:] - l.iloc[-60:]).mean()) if len(h) >= 60 else atr20
         atr_ratio = (atr20 / atr60) if atr60 > 0 else 1.0
-        result["כיווץ ATR (לציון)"] = bool(atr_ratio < 0.95)  # רק לציון
+        result["כיווץ ATR (<0.95)"] = bool(atr_ratio < 0.95)
 
         r_high = float(h.iloc[-20:].max())
         r_low  = float(l.iloc[-20:].min())
@@ -127,13 +128,7 @@ def check_vcp(ticker: str, check_date: str) -> dict:
         result["RSI 35-75"] = bool(35 < rsi < 75)
         result["RSI"]       = round(rsi, 1)
 
-        # ציון
-        crit_keys = [
-            "מעל SMA200", "SMA50 > SMA200", "קרוב לשיא (<30%)",
-            "כיווץ ATR (<0.95)", "בסיס צר (<15%)",
-            "ווליום מתכווץ (<0.95)", "RSI 45-65"
-        ]
-        result["ציון VCP"] = sum(result[k] for k in crit_keys)
+        result["ציון VCP"] = sum(result[k] for k in CRIT_KEYS)
 
     except Exception as e:
         result["הערה"] = str(e)
@@ -171,41 +166,33 @@ if st.button("🔬 הרץ בדיקה", type="primary"):
         prog.progress((i + 1) / len(breakouts))
 
     prog.empty()
-
     df = pd.DataFrame(results)
 
-    crit_keys = [
-        "מעל SMA200", "SMA50 > SMA200", "קרוב לשיא (<30%)",
-        "כיווץ ATR (לציון)", "בסיס צר (<25%)",
-        "ווליום מתכווץ (<1.0)", "RSI 35-75"
-    ]
-
-    # המר לסימנים
+    # המר לסימנים לתצוגה
     df_show = df.copy()
-    for col in crit_keys:
+    for col in CRIT_KEYS:
         if col in df_show.columns:
             df_show[col] = df_show[col].map({True: "✅", False: "❌"})
 
     cols = ["סימול", "תאריך", "מחיר אז", "מחיר היום", "תשואה %",
-            "ציון VCP", "% משיא", "RSI"] + crit_keys
+            "ציון VCP", "% משיא", "RSI"] + CRIT_KEYS
     cols = [c for c in cols if c in df_show.columns]
 
     st.subheader("📊 תוצאות")
-    st.dataframe(df_show[cols].sort_values("תשואה %", ascending=False),
-                 use_container_width=True)
+    st.dataframe(
+        df_show[cols].sort_values("תשואה %", ascending=False),
+        use_container_width=True
+    )
 
-    # מסקנות
     st.subheader("🔍 מסקנות")
-    if "ציון VCP" in df.columns:
-        avg   = df["ציון VCP"].mean()
-        p4    = (df["ציון VCP"] >= 4).sum()
-        p5    = (df["ציון VCP"] >= 5).sum()
-        st.write(f"ציון ממוצע: **{avg:.1f}/7** | עברו 4+: **{p4}/{len(df)}** | עברו 5+: **{p5}/{len(df)}**")
+    avg = df["ציון VCP"].mean()
+    p4  = (df["ציון VCP"] >= 4).sum()
+    p5  = (df["ציון VCP"] >= 5).sum()
+    st.write(f"ציון ממוצע: **{avg:.1f}/7** | עברו 4+: **{p4}/{len(df)}** | עברו 5+: **{p5}/{len(df)}**")
 
-        # קריטריון שנכשל הכי הרבה
-        fail_counts = {k: int((df[k] == False).sum()) for k in crit_keys if k in df.columns}
-        worst = sorted(fail_counts.items(), key=lambda x: x[1], reverse=True)
-        st.write("**קריטריונים שנכשלו הכי הרבה:**")
-        for name, count in worst:
-            bar_fill = "🟥" * count + "⬜" * (len(df) - count)
-            st.write(f"- {name}: {count}/{len(df)}  {bar_fill}")
+    fail_counts = {k: int((df[k] == False).sum()) for k in CRIT_KEYS if k in df.columns}
+    worst = sorted(fail_counts.items(), key=lambda x: x[1], reverse=True)
+    st.write("**קריטריונים שנכשלו הכי הרבה:**")
+    for name, count in worst:
+        bar = "🟥" * count + "⬜" * (len(df) - count)
+        st.write(f"- {name}: {count}/{len(df)}  {bar}")
