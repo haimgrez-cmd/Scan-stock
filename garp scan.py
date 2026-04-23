@@ -60,10 +60,18 @@ def check_vcp_on_date(ticker: str, check_date: str) -> dict:
     try:
         dt    = datetime.strptime(check_date, "%Y-%m-%d")
         start = (dt - timedelta(days=400)).strftime("%Y-%m-%d")
-        end   = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
+        end   = (dt + timedelta(days=2)).strftime("%Y-%m-%d")
 
         raw = yf.download(ticker, start=start, end=end,
-                          auto_adjust=True, progress=False)
+                          auto_adjust=True, progress=False,
+                          group_by="column")
+
+        # טיפול ב-MultiIndex
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+
+        raw = raw[["Close","High","Low","Volume"]].dropna()
+
         if raw.empty or len(raw) < 150:
             result["הערה"] = "אין מספיק נתונים"
             result.update(criteria)
@@ -78,8 +86,11 @@ def check_vcp_on_date(ticker: str, check_date: str) -> dict:
         result["מחיר באותו יום"] = round(last, 2)
 
         # מחיר היום
-        today_data = yf.download(ticker, period="1d",
-                                 auto_adjust=True, progress=False)
+        today_data = yf.download(ticker, period="5d",
+                                 auto_adjust=True, progress=False,
+                                 group_by="column")
+        if isinstance(today_data.columns, pd.MultiIndex):
+            today_data.columns = today_data.columns.get_level_values(0)
         if not today_data.empty:
             today_price = float(today_data["Close"].iloc[-1])
             result["מחיר היום"] = round(today_price, 2)
