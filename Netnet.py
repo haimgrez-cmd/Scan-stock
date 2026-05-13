@@ -151,6 +151,498 @@ UNIVERSE_OPTIONS = {
     "🏛️ S&P 500":                       "sp500",
     "✏️ טיקרים ידניים":                 "custom",
 }
+universe_choice = st.sidebar.selectbox(
+    "🌐 יקום מניות", list(UNIVERSE_OPTIONS.keys()), key="nn_universe"
+)
+
+custom_tickers_raw = ""
+if universe_choice == "✏️ טיקרים ידניים":
+    custom_tickers_raw = st.sidebar.text_area(
+        "הכנס טיקרים (פסיק / רווח / שורה חדשה)",
+        placeholder="AAPL, MSFT, GOOG ...",
+        height=120,
+        key="nn_custom_tickers",
+    )
+
+max_tickers = st.sidebar.number_input(
+    "מקסימום מניות לסריקה",
+    min_value=50, max_value=3000, value=300, step=50,
+    help="~300 מניות ≈ 10 דקות. הגדל בזהירות.",
+    key="nn_max_tickers",
+)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔍 פילטרים")
+
+price_min = st.sidebar.number_input(
+    "מחיר מינימום ($)", value=0.5, step=0.5, min_value=0.0, key="nn_price_min"
+)
+price_max = st.sidebar.number_input(
+    "מחיר מקסימום ($)", value=200.0, step=10.0, key="nn_price_max"
+)
+
+ncav_ratio_max = st.sidebar.slider(
+    "P/NCAV מקסימום",
+    min_value=0.1, max_value=1.5, value=0.67, step=0.01,
+    help="Graham: 0.67 = 2/3 NCAV",
+    key="nn_ncav_ratio",
+)
+
+show_conservative = st.sidebar.checkbox(
+    "📊 Conservative NCAV", value=True, key="nn_conservative"
+)
+exclude_financials = st.sidebar.checkbox(
+    "🏦 הסר בנקים/ביטוח", value=True, key="nn_excl_fin"
+)
+
+st.sidebar.markdown("---")
+delay_ms = st.sidebar.slider(
+    "השהיה בין טיקרים (ms)", 50, 400, 120, 25, key="nn_delay"
+)
+
+FINANCIAL_KEYWORDS_SECTOR = {"Financial Services", "Financial", "Banks"}
+FINANCIAL_KEYWORDS_INDUSTRY = {"Bank", "Insur", "REIT", "Mortgage", "Thrift", "Brokerage"}
+
+
+# ─── ANALYZER ────────────────────────────────────────────────────────────────
+def safe_get(info, *keys, default=None):
+    for k in keys:
+        v = info.get(k)
+        if v is not None and not (isinstance(v, float) and np.isnan(v)):
+            return v
+    return default
+
+
+def row_val(bs, col, *names):
+    for n in names:
+        if n in bs.index:
+            v = bs.loc[n, col]
+            if pd.notna(v):
+                return float(v)
+    return None
+
+
+def analyze_ticker(ticker: str) -> dict | None:
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info or {}
+        bs = t.balance_sheet
+
+        price = safe_get(info, "currentPrice", "regularMarketPrice", "previousClose")
+        if not price or price <= 0:
+            return None
+        if not (price_min <= price <= price_max):
+            return None
+
+        if exclude_financials:
+            sector = info.get("sector", "")
+            industry = info.get("industry", "")
+            if (sector in FINANCIAL_KEYWORDS_SECTOR or
+                    any(kw in industry for kw in FINANCIAL_KEYWORDS_INDUSTRY)):
+                return None
+
+        if bs is None or bs.empty:
+            return None
+        col = bs.columns[0]
+
+        current_assets = row_val(bs, col,
+            "Current Assets", "Total Current Assets",
+            "CurrentAssets", "TotalCurrentAssets")
+        total_liabilities = row_val(bs, col,
+            "Total Liabilities Net Minority Interest",
+            "TotalLiabilitiesNetMinorityInterest",
+            "Total Liabilities", "TotalLiabilities")
+
+        if current_assets is None or total_liabilities is None:
+            return None
+
+        shares = safe_get(info, "sharesOutstanding", "impliedSharesOutstanding")
+        if not shares or shares <= 0:
+            return None
+
+        ncav = current_assets - total_liabilities
+        ncav_per_share = ncav / shares
+        if ncav_per_share <= 0:
+            return None
+
+        p_ncav = price / ncav_per_share
+        if p_ncav > ncav_ratio_max:
+            return None
+
+        # Conservative NCAV
+        con_ncav_ps = None
+        if show_conservative:
+            cash = row_val(bs, col,
+                "Cash And Cash Equivalents", "Cash",
+                "CashAndCashEquivalents",
+                "Cash Cash Equivalents And Short Term Investments") or 0.0
+            ar = row_val(bs, col,
+                "Net Receivables", "Receivables",
+                "Accounts Receivable", "AccountsReceivable") or 0.0
+            inv = row_val(bs, col, "Inventory", "Inventories") or 0.0
+            other_ca = max(0.0, current_assets - cash - ar - inv)
+            con_ncav = (
+                cash * 1.0
+                + ar * 0.75
+                + inv * 0.5
+                + other_ca * 0.25
+                - total_liabilities
+            )
+            con_ncav_ps = con_ncav / shares if shares else None
+
+        mktcap = safe_get(info, "marketCap")
+        mktcap_m = mktcap / 1e6 if mktcap else None
+
+        cl = row_val(bs, col,
+            "Current Liabilities", "Total Current Liabilities",
+            "CurrentLiabilities", "TotalCurrentLiabilities")
+        current_ratio = current_assets / cl if cl and cl > 0 else None
+
+        return {
+            "Ticker":            ticker,
+            "שם":                info.get("shortName", ticker),
+            "סקטור":             info.get("sector", ""),
+            "מחיר ($)":          round(price, 2),
+            "NCAV/מניה ($)":     round(ncav_per_share, 2),
+            "P/NCAV":            round(p_ncav, 3),
+            "שולי ביטחון %":     round((1 - p_ncav) * 100, 1),
+            "Con.NCAV/מניה":     round(con_ncav_ps, 2) if con_ncav_ps is not None else None,
+            "P/Con.NCAV":        round(price / con_ncav_ps, 3) if (con_ncav_ps and con_ncav_ps > 0) else None,
+            "CA ($M)":           round(current_assets / 1e6, 1),
+            "TL ($M)":           round(total_liabilities / 1e6, 1),
+            "NCAV ($M)":         round(ncav / 1e6, 1),
+            "Current Ratio":     round(current_ratio, 2) if current_ratio else None,
+            "שווי שוק ($M)":     round(mktcap_m, 1) if mktcap_m else None,
+            "P/B":               safe_get(info, "priceToBook"),
+            "Country":           info.get("country", ""),
+            "בורסה":             info.get("exchange", ""),
+        }
+    except Exception:
+        return None
+
+
+# ─── BUILD TICKER LIST ───────────────────────────────────────────────────────
+def build_ticker_list(choice_key: str) -> list:
+    key = UNIVERSE_OPTIONS[choice_key]
+
+    if key == "sp500":
+        with st.spinner("טוען S&P 500..."):
+            return get_sp500_tickers()
+
+    if key == "custom":
+        raw = custom_tickers_raw.replace(",", " ").split()
+        return [t.strip().upper() for t in raw if t.strip()]
+
+    # ── NASDAQ API ──
+    placeholder = st.empty()
+    placeholder.info("⏳ שולף רשימת מניות מ-NASDAQ API (~5,000–8,000 מניות)...")
+    try:
+        df_all = fetch_nasdaq_universe()
+        placeholder.empty()
+    except Exception as e:
+        placeholder.warning(
+            f"NASDAQ API נכשל ({e})\n"
+            "עובר ל-SEC EDGAR (ללא סינון שווי שוק)..."
+        )
+        import random
+        tickers = fetch_sec_tickers()
+        random.shuffle(tickers)
+        return tickers[:int(max_tickers)]
+
+    # סנן לפי שווי שוק
+    has_cap = df_all["mktcap_usd"].notna()
+    if key == "micro":
+        mask = has_cap & (df_all["mktcap_usd"] < 300e6)
+    elif key == "small":
+        mask = has_cap & (df_all["mktcap_usd"] >= 300e6) & (df_all["mktcap_usd"] < 2e9)
+    else:  # micro_small
+        mask = has_cap & (df_all["mktcap_usd"] < 2e9)
+
+    df_filtered = df_all[mask].sort_values("mktcap_usd")  # הכי קטנות קודם
+    tickers = df_filtered["ticker"].tolist()
+
+    total_available = len(tickers)
+    tickers = tickers[:int(max_tickers)]
+
+    st.info(
+        f"🗂️ נמצאו **{total_available:,}** מניות בקטגוריה | "
+        f"סורק **{len(tickers)}** ראשונות (לפי שווי שוק עולה)"
+    )
+    return tickers
+
+
+# ─── MAIN SCAN ───────────────────────────────────────────────────────────────
+st.markdown("---")
+col1, col2 = st.columns([2, 5])
+run_scan = col1.button("🔍 הרץ סריקה", type="primary", use_container_width=True)
+col2.markdown(
+    "<div class='warn-box'>⚠️ Micro cap = זמן ארוך. "
+    "מומלץ להתחיל ב-200–300 מניות. "
+    "yfinance עלול להחזיר נתונים חסרים — תאמת מול SEC Edgar.</div>",
+    unsafe_allow_html=True,
+)
+
+if run_scan:
+    tickers = build_ticker_list(universe_choice)
+
+    if not tickers:
+        st.error("לא נמצאו טיקרים. בדוק קלט.")
+        st.stop()
+
+    progress_bar = st.progress(0)
+    status_txt = st.empty()
+    results = []
+    skipped = 0
+
+    for i, ticker in enumerate(tickers):
+        status_txt.text(
+            f"[{i+1}/{len(tickers)}]  {ticker:<8}  |  נמצאו: {len(results)}"
+        )
+        result = analyze_ticker(ticker)
+        if result:
+            results.append(result)
+            if len(results) >= 100:
+                st.info("נמצאו 100 מניות Net-Net — עוצר סריקה מוקדם.")
+                break
+        else:
+            skipped += 1
+
+        progress_bar.progress((i + 1) / len(tickers))
+        time.sleep(delay_ms / 1000)
+
+    progress_bar.empty()
+    status_txt.empty()
+
+    if not results:
+        st.warning("לא נמצאו מניות Net-Net. נסה להרחיב P/NCAV מקסימום או לשנות יקום.")
+        st.stop()
+
+    df = pd.DataFrame(results).sort_values("P/NCAV")
+
+    # ── מדדים עיקריים ──
+    m1, m2, m3, m4 = st.columns(4)
+    metrics = [
+        (str(len(df)), "מניות Net-Net שנמצאו"),
+        (f"{df['שולי ביטחון %'].mean():.1f}%", "שולי ביטחון ממוצעים"),
+        (f"{df.iloc[0]['Ticker']} ({df.iloc[0]['P/NCAV']})", "הזול ביותר (P/NCAV)"),
+        (f"{len(tickers) - skipped:,}", "טיקרים נסרקו בהצלחה"),
+    ]
+    for col, (val, lbl) in zip([m1, m2, m3, m4], metrics):
+        col.markdown(
+            f"<div class='metric-box'>"
+            f"<div class='metric-val'>{val}</div>"
+            f"<div class='metric-lbl'>{lbl}</div></div>",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("---")
+    st.subheader(f"📋 תוצאות ({len(df)} מניות Net-Net)")
+
+    def color_pncav(val):
+        if isinstance(val, (int, float)):
+            if val < 0.33: return "color: #68d391; font-weight: bold"
+            if val < 0.5:  return "color: #f6e05e"
+            return "color: #fc8181"
+        return ""
+
+    cols_show = [
+        "Ticker", "שם", "סקטור", "מחיר ($)",
+        "NCAV/מניה ($)", "P/NCAV", "שולי ביטחון %",
+    ]
+    if show_conservative:
+        cols_show += ["Con.NCAV/מניה", "P/Con.NCAV"]
+    cols_show += [
+        "CA ($M)", "TL ($M)", "NCAV ($M)",
+        "Current Ratio", "שווי שוק ($M)", "P/B", "Country",
+    ]
+
+    # pandas >= 2.1: applymap → map on Styler
+    _styler = df[cols_show].style
+    try:
+        styled = _styler.map(color_pncav, subset=["P/NCAV"]).format(na_rep="—", precision=2)
+    except AttributeError:
+        styled = _styler.applymap(color_pncav, subset=["P/NCAV"]).format(na_rep="—", precision=2)
+    st.dataframe(styled, use_container_width=True, height=500)
+
+    # ייצוא CSV
+    csv_buf = io.StringIO()
+    df.to_csv(csv_buf, index=False, encoding="utf-8-sig")
+    st.download_button(
+        "⬇️ ייצא לCSV",
+        data=csv_buf.getvalue().encode("utf-8-sig"),
+        file_name=f"netnet_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+        mime="text/csv",
+    )
+
+    with st.expander("📖 מתודולוגיה"):
+        st.markdown("""
+**NCAV** = Current Assets − Total Liabilities  
+**Graham Criterion**: Price < ⅔ × NCAV per Share  
+**Conservative NCAV** = Cash×100% + AR×75% + Inventory×50% + OtherCA×25% − All Liabilities  
+
+**מקור יקום**:  
+• `NASDAQ Screener API` — כל המניות ב-NASDAQ / NYSE / AMEX עם שווי שוק  
+• גיבוי: `SEC EDGAR company_tickers.json` (~12,000 חברות)  
+
+הרשימה ממוינת לפי שווי שוק עולה — הכי קטנות נסרקות ראשונות,  
+כי Net-Nets אמיתיים נמצאים בעיקר שם.
+        """)
+
+st.markdown("---")
+st.caption("לא המלצת השקעה. Net-Net דורש פיזור רחב. אמת נתונים מול SEC Edgar.")
+"""
+Net-Net Stock Scanner — Benjamin Graham Style
+==============================================
+יקום מניות: NASDAQ API + SEC EDGAR → אלפי small/micro caps
+"""
+
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import requests
+import time
+import io
+from datetime import datetime
+
+# ─── PAGE CONFIG ─────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Net-Net Scanner | Graham Style",
+    page_icon="💎",
+    layout="wide",
+)
+
+st.markdown("""
+<style>
+    .metric-box {
+        background: linear-gradient(135deg, #1a1f2e, #252d3d);
+        border: 1px solid #2d3748;
+        border-radius: 8px;
+        padding: 16px;
+        text-align: center;
+    }
+    .metric-val { font-size: 2rem; font-weight: 700; color: #48bb78; }
+    .metric-lbl { font-size: 0.8rem; color: #a0aec0; margin-top: 4px; }
+    .info-box {
+        background: #1a2744;
+        border-left: 4px solid #4299e1;
+        padding: 12px 16px;
+        border-radius: 0 8px 8px 0;
+        margin: 12px 0;
+        font-size: 0.88rem;
+        color: #bee3f8;
+    }
+    .warn-box {
+        background: #2d1b00;
+        border-left: 4px solid #ed8936;
+        padding: 12px 16px;
+        border-radius: 0 8px 8px 0;
+        margin: 12px 0;
+        font-size: 0.88rem;
+        color: #fbd38d;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ─── HEADER ──────────────────────────────────────────────────────────────────
+st.title("💎 Net-Net Stock Scanner")
+st.markdown(
+    "<div class='info-box'>"
+    "מחפש מניות לפי שיטת בנג'מין גרהאם: <b>Price &lt; 2/3 × NCAV per Share</b><br>"
+    "NCAV = רכוש שוטף − כל ההתחייבויות | "
+    "יקום: כל המניות ב-NASDAQ/NYSE/AMEX כולל small &amp; micro cap"
+    "</div>",
+    unsafe_allow_html=True,
+)
+
+# ─── UNIVERSE LOADERS ────────────────────────────────────────────────────────
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nasdaq.com/",
+}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_nasdaq_universe() -> pd.DataFrame:
+    """
+    שולף את כל המניות מה-NASDAQ Screener API.
+    מחזיר DataFrame עם: ticker, company, mktcap_usd, sector, industry, exchange.
+    """
+    url = (
+        "https://api.nasdaq.com/api/screener/stocks"
+        "?tableonly=true&limit=10000&offset=0&download=true"
+    )
+    r = requests.get(url, headers=HEADERS, timeout=25)
+    r.raise_for_status()
+    data = r.json()
+    rows = data["data"]["rows"]
+    df = pd.DataFrame(rows)
+
+    def parse_mktcap(v):
+        if not v or str(v).strip() in ("", "N/A", "None"):
+            return None
+        v = str(v).strip().upper().replace(",", "")
+        try:
+            if v.endswith("T"):
+                return float(v[:-1]) * 1e12
+            if v.endswith("B"):
+                return float(v[:-1]) * 1e9
+            if v.endswith("M"):
+                return float(v[:-1]) * 1e6
+            return float(v)
+        except Exception:
+            return None
+
+    df["mktcap_usd"] = df["marketCap"].apply(parse_mktcap)
+    df = df.rename(columns={"symbol": "ticker", "name": "company"})
+    df = df[df["ticker"].notna() & (df["ticker"] != "")].copy()
+
+    # הסר ETFs / warrants / units
+    df = df[~df["ticker"].str.contains(r"[/\^~\+]", na=False, regex=True)]
+    df = df[df["ticker"].str.len() <= 5]
+
+    return df[["ticker", "company", "mktcap_usd", "sector", "industry", "exchange"]].reset_index(drop=True)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_sec_tickers() -> list:
+    """גיבוי: שולף את כל הטיקרים מ-SEC EDGAR (~12k חברות)."""
+    url = "https://www.sec.gov/files/company_tickers.json"
+    r = requests.get(
+        url,
+        headers={"User-Agent": "research@example.com"},
+        timeout=15,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return [v["ticker"] for v in data.values() if v.get("ticker")]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_sp500_tickers() -> list:
+    tables = pd.read_html(
+        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    )
+    return tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
+
+
+# ─── SIDEBAR ─────────────────────────────────────────────────────────────────
+st.sidebar.header("⚙️ הגדרות סריקה")
+
+UNIVERSE_OPTIONS = {
+    "🔬 Micro Cap  (< $300M)":          "micro",
+    "📦 Small Cap  ($300M – $2B)":      "small",
+    "🔬+📦 Micro + Small Cap":          "micro_small",
+    "🏛️ S&P 500":                       "sp500",
+    "✏️ טיקרים ידניים":                 "custom",
+}
 universe_choice = st.sidebar.selectbox("🌐 יקום מניות", list(UNIVERSE_OPTIONS.keys()))
 
 custom_tickers_raw = ""
