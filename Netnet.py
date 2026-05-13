@@ -1,4 +1,413 @@
 """
+Net-Net Stock Scanner - Graham Style
+yקום: NASDAQ API (כל המניות) + SEC EDGAR כגיבוי
+"""
+
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import requests
+import time
+import io
+from datetime import datetime
+from typing import Optional
+
+st.set_page_config(page_title="Net-Net Scanner", page_icon="💎", layout="wide")
+
+st.markdown("""
+<style>
+.metric-box {
+    background: linear-gradient(135deg, #1a1f2e, #252d3d);
+    border: 1px solid #2d3748; border-radius: 8px;
+    padding: 16px; text-align: center; margin-bottom: 8px;
+}
+.metric-val { font-size: 1.8rem; font-weight: 700; color: #48bb78; }
+.metric-lbl { font-size: 0.78rem; color: #a0aec0; margin-top: 4px; }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("💎 Net-Net Stock Scanner — Graham Style")
+st.caption("Price < 2/3 × NCAV per Share  |  NCAV = Current Assets − Total Liabilities")
+
+# ── UNIVERSE OPTIONS (ללא אמוג'י במזהה) ──────────────────────────────────────
+UNIVERSE_LABELS = [
+    "Micro Cap (< $300M)",
+    "Small Cap ($300M - $2B)",
+    "Micro + Small Cap",
+    "S&P 500",
+    "Custom Tickers",
+]
+UNIVERSE_KEYS = ["micro", "small", "micro_small", "sp500", "custom"]
+
+# ── SIDEBAR ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("Settings")
+
+    uni_idx = st.selectbox(
+        "Universe",
+        options=range(len(UNIVERSE_LABELS)),
+        format_func=lambda i: UNIVERSE_LABELS[i],
+        key="netnet_universe_idx",
+    )
+    universe_key = UNIVERSE_KEYS[uni_idx]
+
+    custom_input = ""
+    if universe_key == "custom":
+        custom_input = st.text_area(
+            "Tickers (comma / space / newline)",
+            placeholder="AAPL, MSFT, GOOG",
+            key="netnet_custom_input",
+        )
+
+    max_scan = st.number_input(
+        "Max tickers to scan",
+        min_value=50, max_value=3000, value=300, step=50,
+        key="netnet_max_scan",
+    )
+
+    st.markdown("---")
+    st.subheader("Filters")
+
+    price_min = st.number_input(
+        "Min price ($)", min_value=0.0, value=0.5, step=0.5,
+        key="netnet_price_min",
+    )
+    price_max = st.number_input(
+        "Max price ($)", min_value=0.0, value=200.0, step=10.0,
+        key="netnet_price_max",
+    )
+    ncav_max = st.slider(
+        "Max P/NCAV (Graham: 0.67)",
+        min_value=0.10, max_value=1.50, value=0.67, step=0.01,
+        key="netnet_ncav_max",
+    )
+    show_con = st.checkbox(
+        "Show Conservative NCAV", value=True,
+        key="netnet_show_con",
+    )
+    excl_fin = st.checkbox(
+        "Exclude banks / insurance", value=True,
+        key="netnet_excl_fin",
+    )
+
+    st.markdown("---")
+    delay_ms = st.slider(
+        "Delay between tickers (ms)",
+        min_value=50, max_value=400, value=120, step=25,
+        key="netnet_delay_ms",
+    )
+
+# ── DATA SOURCES ──────────────────────────────────────────────────────────────
+NASDAQ_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    "Referer": "https://www.nasdaq.com/",
+}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_nasdaq_all() -> pd.DataFrame:
+    url = (
+        "https://api.nasdaq.com/api/screener/stocks"
+        "?tableonly=true&limit=10000&offset=0&download=true"
+    )
+    r = requests.get(url, headers=NASDAQ_HEADERS, timeout=25)
+    r.raise_for_status()
+    rows = r.json()["data"]["rows"]
+    df = pd.DataFrame(rows)
+
+    def parse_cap(v):
+        if not v or str(v).strip() in ("", "N/A"):
+            return None
+        s = str(v).strip().upper().replace(",", "")
+        try:
+            if s.endswith("T"): return float(s[:-1]) * 1e12
+            if s.endswith("B"): return float(s[:-1]) * 1e9
+            if s.endswith("M"): return float(s[:-1]) * 1e6
+            return float(s)
+        except Exception:
+            return None
+
+    df["cap"] = df["marketCap"].apply(parse_cap)
+    df = df.rename(columns={"symbol": "ticker"})
+    df = df[df["ticker"].notna() & (df["ticker"] != "")]
+    df = df[~df["ticker"].str.contains(r"[/\^~+]", na=False, regex=True)]
+    df = df[df["ticker"].str.len() <= 5]
+    return df[["ticker", "cap"]].reset_index(drop=True)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_sec_tickers() -> list:
+    r = requests.get(
+        "https://www.sec.gov/files/company_tickers.json",
+        headers={"User-Agent": "research@example.com"},
+        timeout=15,
+    )
+    r.raise_for_status()
+    return [v["ticker"] for v in r.json().values() if v.get("ticker")]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_sp500() -> list:
+    df = pd.read_html(
+        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    )[0]
+    return df["Symbol"].str.replace(".", "-", regex=False).tolist()
+
+
+def get_tickers(ukey: str, custom: str, max_n: int) -> list:
+    if ukey == "sp500":
+        return load_sp500()
+    if ukey == "custom":
+        parts = custom.replace(",", " ").split()
+        return [t.strip().upper() for t in parts if t.strip()]
+
+    # NASDAQ API
+    try:
+        df_all = load_nasdaq_all()
+    except Exception as e:
+        st.warning(f"NASDAQ API failed ({e}) — falling back to SEC EDGAR")
+        import random
+        t = load_sec_tickers()
+        random.shuffle(t)
+        return t[:max_n]
+
+    has_cap = df_all["cap"].notna()
+    if ukey == "micro":
+        mask = has_cap & (df_all["cap"] < 300e6)
+    elif ukey == "small":
+        mask = has_cap & (df_all["cap"] >= 300e6) & (df_all["cap"] < 2e9)
+    else:
+        mask = has_cap & (df_all["cap"] < 2e9)
+
+    result = df_all[mask].sort_values("cap")["ticker"].tolist()
+    total = len(result)
+    result = result[:max_n]
+    st.info(f"Found {total:,} tickers in category — scanning first {len(result)} (smallest first)")
+    return result
+
+
+# ── ANALYZER ──────────────────────────────────────────────────────────────────
+FIN_SECTORS = {"Financial Services", "Financial", "Banks"}
+FIN_INDS = {"Bank", "Insur", "REIT", "Mortgage", "Thrift", "Brokerage"}
+
+
+def safe(info: dict, *keys, default=None):
+    for k in keys:
+        v = info.get(k)
+        if v is not None and not (isinstance(v, float) and np.isnan(v)):
+            return v
+    return default
+
+
+def bval(bs, col, *names) -> Optional[float]:
+    for n in names:
+        if n in bs.index:
+            v = bs.loc[n, col]
+            if pd.notna(v):
+                return float(v)
+    return None
+
+
+def analyze(ticker: str) -> Optional[dict]:
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info or {}
+        bs = t.balance_sheet
+        if bs is None or bs.empty:
+            return None
+
+        price = safe(info, "currentPrice", "regularMarketPrice", "previousClose")
+        if not price or price <= 0:
+            return None
+        if not (price_min <= price <= price_max):
+            return None
+
+        if excl_fin:
+            sec = info.get("sector", "")
+            ind = info.get("industry", "")
+            if sec in FIN_SECTORS or any(k in ind for k in FIN_INDS):
+                return None
+
+        col = bs.columns[0]
+
+        ca = bval(bs, col, "Current Assets", "Total Current Assets",
+                  "CurrentAssets", "TotalCurrentAssets")
+        tl = bval(bs, col,
+                  "Total Liabilities Net Minority Interest",
+                  "TotalLiabilitiesNetMinorityInterest",
+                  "Total Liabilities", "TotalLiabilities")
+
+        if ca is None or tl is None:
+            return None
+
+        shares = safe(info, "sharesOutstanding", "impliedSharesOutstanding")
+        if not shares or shares <= 0:
+            return None
+
+        ncav = ca - tl
+        ncav_ps = ncav / shares
+        if ncav_ps <= 0:
+            return None
+
+        p_ncav = price / ncav_ps
+        if p_ncav > ncav_max:
+            return None
+
+        # Conservative NCAV
+        con_ps = None
+        if show_con:
+            cash = bval(bs, col, "Cash And Cash Equivalents", "Cash",
+                        "CashAndCashEquivalents",
+                        "Cash Cash Equivalents And Short Term Investments") or 0.0
+            ar   = bval(bs, col, "Net Receivables", "Receivables",
+                        "Accounts Receivable", "AccountsReceivable") or 0.0
+            inv  = bval(bs, col, "Inventory", "Inventories") or 0.0
+            other = max(0.0, ca - cash - ar - inv)
+            con = cash * 1.0 + ar * 0.75 + inv * 0.5 + other * 0.25 - tl
+            con_ps = con / shares
+
+        cl = bval(bs, col, "Current Liabilities", "Total Current Liabilities",
+                  "CurrentLiabilities", "TotalCurrentLiabilities")
+        cr = ca / cl if cl and cl > 0 else None
+        mc = safe(info, "marketCap")
+
+        row = {
+            "Ticker":          ticker,
+            "Name":            info.get("shortName", ticker),
+            "Sector":          info.get("sector", ""),
+            "Price":           round(price, 2),
+            "NCAV/Share":      round(ncav_ps, 2),
+            "P/NCAV":          round(p_ncav, 3),
+            "Margin of Safety": round((1 - p_ncav) * 100, 1),
+            "CA ($M)":         round(ca / 1e6, 1),
+            "TL ($M)":         round(tl / 1e6, 1),
+            "NCAV ($M)":       round(ncav / 1e6, 1),
+            "Curr.Ratio":      round(cr, 2) if cr else None,
+            "Mkt Cap ($M)":    round(mc / 1e6, 1) if mc else None,
+            "P/B":             safe(info, "priceToBook"),
+            "Country":         info.get("country", ""),
+        }
+        if show_con:
+            row["Con.NCAV/Share"] = round(con_ps, 2) if con_ps is not None else None
+            row["P/Con.NCAV"]     = round(price / con_ps, 3) if con_ps and con_ps > 0 else None
+
+        return row
+
+    except Exception:
+        return None
+
+
+# ── SCAN BUTTON ───────────────────────────────────────────────────────────────
+st.markdown("---")
+run = st.button("Run Scan", type="primary", key="netnet_run_btn")
+
+if run:
+    tickers = get_tickers(universe_key, custom_input, int(max_scan))
+
+    if not tickers:
+        st.error("No tickers found. Check input.")
+        st.stop()
+
+    st.write(f"Scanning **{len(tickers)}** tickers …")
+    bar   = st.progress(0)
+    info  = st.empty()
+    found = []
+
+    for i, tk in enumerate(tickers):
+        info.text(f"[{i+1}/{len(tickers)}]  {tk:<8}  found so far: {len(found)}")
+        res = analyze(tk)
+        if res:
+            found.append(res)
+            if len(found) >= 100:
+                st.info("Reached 100 Net-Net stocks — stopping early.")
+                break
+        bar.progress((i + 1) / len(tickers))
+        time.sleep(delay_ms / 1000)
+
+    bar.empty()
+    info.empty()
+
+    if not found:
+        st.warning("No Net-Net stocks found. Try raising Max P/NCAV or changing universe.")
+        st.stop()
+
+    df = pd.DataFrame(found).sort_values("P/NCAV")
+
+    # ── Summary metrics ──
+    c1, c2, c3, c4 = st.columns(4)
+    for col, val, lbl in [
+        (c1, str(len(df)),                          "Net-Net stocks found"),
+        (c2, f"{df['Margin of Safety'].mean():.1f}%", "Avg margin of safety"),
+        (c3, f"{df.iloc[0]['Ticker']} ({df.iloc[0]['P/NCAV']})", "Cheapest (P/NCAV)"),
+        (c4, str(len(tickers)),                     "Tickers scanned"),
+    ]:
+        col.markdown(
+            f"<div class='metric-box'>"
+            f"<div class='metric-val'>{val}</div>"
+            f"<div class='metric-lbl'>{lbl}</div></div>",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("---")
+    st.subheader(f"Results — {len(df)} Net-Net stocks")
+
+    # ── Color coding ──
+    def color_p(val):
+        try:
+            v = float(val)
+            if v < 0.33: return "color: #68d391; font-weight:bold"
+            if v < 0.50: return "color: #f6e05e"
+            return "color: #fc8181"
+        except Exception:
+            return ""
+
+    # ── Column order ──
+    base_cols = ["Ticker", "Name", "Sector", "Price", "NCAV/Share",
+                 "P/NCAV", "Margin of Safety"]
+    if show_con:
+        base_cols += ["Con.NCAV/Share", "P/Con.NCAV"]
+    base_cols += ["CA ($M)", "TL ($M)", "NCAV ($M)",
+                  "Curr.Ratio", "Mkt Cap ($M)", "P/B", "Country"]
+
+    styler = df[base_cols].style.format(na_rep="—", precision=2)
+    # pandas >= 2.1 uses .map(); older versions use .applymap()
+    try:
+        styler = styler.map(color_p, subset=["P/NCAV"])
+    except AttributeError:
+        styler = styler.applymap(color_p, subset=["P/NCAV"])
+
+    st.dataframe(styler, use_container_width=True, height=480)
+
+    # ── Export ──
+    buf = io.StringIO()
+    df.to_csv(buf, index=False, encoding="utf-8-sig")
+    st.download_button(
+        "Download CSV",
+        data=buf.getvalue().encode("utf-8-sig"),
+        file_name=f"netnet_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+        mime="text/csv",
+        key="netnet_download",
+    )
+
+    with st.expander("Methodology"):
+        st.markdown("""
+**NCAV** = Current Assets − Total Liabilities  
+**Graham Criterion**: Price < 2/3 × NCAV per Share (P/NCAV < 0.67)  
+**Conservative NCAV** = Cash×100% + AR×75% + Inventory×50% + OtherCA×25% − All Liabilities  
+
+**Universe source**: NASDAQ Screener API (all NASDAQ/NYSE/AMEX listed stocks with market cap).  
+**Fallback**: SEC EDGAR `company_tickers.json` (~12,000 tickers).  
+Sorted by market cap ascending — smallest first, as Net-Nets mostly appear there.
+        """)
+
+st.markdown("---")
+st.caption("Not investment advice. Net-Net requires broad diversification. Verify data via SEC Edgar.")
+"""
 Net-Net Stock Scanner — Benjamin Graham Style
 ==============================================
 יקום מניות: NASDAQ API + SEC EDGAR → אלפי small/micro caps
