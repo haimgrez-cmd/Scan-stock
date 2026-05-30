@@ -1,3 +1,14 @@
+"""
+סורק מומנטום רבעוני — S&P 500
+תיקונים v2:
+  1. סף מינימום ROC (לא רק > 0)
+  2. בדיקת גיל מניה לפני dropna (מונע SNDK ודומות)
+  3. RSI גבול תחתון + עליון
+  4. בדיקת קרבה לשיא 52 שבועות
+  5. תיקון באג batch טיקר בודד
+  6. קיצוץ ROC outliers לפני חישוב ציון
+"""
+
 import time
 import logging
 import streamlit as st
@@ -16,6 +27,7 @@ st.caption(f"עדכון: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
 DATA_PERIOD = "380d"
 BATCH_SIZE  = 50
 SLEEP       = 1.0
+MIN_DAYS    = 280   # תיקון #2: מניה חייבת לפחות 280 ימי מסחר אמיתיים
 
 
 # ─── טיקרים ────────────────────────────────────────────────────────────────
@@ -40,13 +52,13 @@ def get_tickers() -> list[str]:
         "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","JPM","V","XOM",
         "PG","MA","HD","CVX","MRK","ABBV","PEP","KO","BAC","AVGO","LLY",
         "COST","TMO","CSCO","MCD","ACN","ABT","WMT","DHR","NEE","TXN","UNH",
-        "CRM","QCOM","HON","AMD","GE","CAT","GS","MS","BLK","AXP","ISRG"
+        "CRM","QCOM","HON","AMD","GE","CAT","GS","MS","BLK","AXP","ISRG",
     ]
 
 
 # ─── RSI ───────────────────────────────────────────────────────────────────
 def calc_rsi(s: pd.Series, n: int = 14) -> float:
-    d = s.diff().dropna()
+    d  = s.diff().dropna()
     if len(d) < n:
         return 50.0
     g  = d.clip(lower=0).ewm(com=n - 1, adjust=False).mean()
@@ -56,9 +68,13 @@ def calc_rsi(s: pd.Series, n: int = 14) -> float:
 
 
 # ─── ציון משוקלל ───────────────────────────────────────────────────────────
-def calc_score(ticker: str, df: pd.DataFrame) -> dict | None:
+def calc_score(ticker: str, df_raw: pd.DataFrame) -> dict | None:
     try:
-        df = df[["Close", "Volume"]].dropna()
+        # תיקון #2: בדוק גיל לפני dropna — מונע outliers מספין-אופים
+        if len(df_raw) < MIN_DAYS:
+            return None
+
+        df = df_raw[["Close", "Volume"]].dropna()
         if len(df) < 252:
             return None
 
@@ -78,40 +94,60 @@ def calc_score(ticker: str, df: pd.DataFrame) -> dict | None:
         if any(np.isnan(x) for x in [sma50, sma100, sma200]):
             return None
 
-        # תנאי סף קשיחים
-        if not (sma50 > sma100 > sma200): return None
-        if last < sma200:                 return None
+        # תנאי עליית מגמה קשיחים
+        if not (sma50 > sma100 > sma200):
+            return None
+        if last < sma200:
+            return None
+
+        # תיקון #4: קרבה לשיא 52 שבועות — לפחות 80% מהשיא
+        high_52w = float(c.rolling(252).max().iloc[-1])
+        if last < high_52w * 0.80:
+            return None
 
         roc3  = float(c.pct_change(63).iloc[-1])  * 100
         roc6  = float(c.pct_change(126).iloc[-1]) * 100
         roc12 = float(c.pct_change(252).iloc[-1]) * 100
 
-        if any(np.isnan(x) for x in [roc3, roc6, roc12]): return None
-        if roc3 < 0 or roc6 < 0 or roc12 < 0:             return None
+        if any(np.isnan(x) for x in [roc3, roc6, roc12]):
+            return None
+
+        # תיקון #1: סף מינימום ROC — מסלק מניות "עצלות"
+        if roc3  < 3:   return None   # לפחות 3%  ב-3  חודשים
+        if roc6  < 8:   return None   # לפחות 8%  ב-6  חודשים
+        if roc12 < 15:  return None   # לפחות 15% ב-12 חודשים
 
         rsi = calc_rsi(c)
-        if rsi > 75: return None
+
+        # תיקון #3: RSI חייב בין 45 ל-75 — לא חלש ולא קנוי-יתר
+        if rsi < 45 or rsi > 75:
+            return None
 
         vol20 = float(v.iloc[-20:].mean())
         vol50 = float(v.iloc[-50:].mean())
         vol_bonus = 5.0 if (vol50 > 0 and vol20 > vol50 * 1.2) else 0.0
 
-        # ציון משוקלל — זהה לבאקטסט
-        score = (roc6 * 0.5) + (roc12 * 0.3) + (roc3 * 0.2) + vol_bonus
+        # תיקון #6: חסום ROC outliers לפני חישוב ציון
+        roc3_c  = float(np.clip(roc3,  -100, 100))
+        roc6_c  = float(np.clip(roc6,  -100, 150))
+        roc12_c = float(np.clip(roc12, -100, 200))
+
+        score = (roc6_c * 0.5) + (roc12_c * 0.3) + (roc3_c * 0.2) + vol_bonus
 
         if score <= 0:
             return None
 
         return {
-            "סימול":     ticker,
-            "מחיר":      round(float(last), 2),
-            "ציון":      round(float(score), 1),
-            "ROC 3M %":  round(roc3,  1),
-            "ROC 6M %":  round(roc6,  1),
-            "ROC 12M %": round(roc12, 1),
-            "RSI":       round(rsi,   1),
-            "SMA50":     round(sma50,  2),
-            "SMA200":    round(sma200, 2),
+            "סימול":      ticker,
+            "מחיר":       round(float(last), 2),
+            "ציון":       round(float(score), 1),
+            "ROC 3M %":   round(roc3,  1),
+            "ROC 6M %":   round(roc6,  1),
+            "ROC 12M %":  round(roc12, 1),
+            "RSI":        round(rsi,   1),
+            "% מהשיא":    round((last / high_52w) * 100, 1),
+            "SMA50":      round(sma50,  2),
+            "SMA200":     round(sma200, 2),
         }
 
     except Exception as e:
@@ -138,7 +174,14 @@ def analyze_batch(tickers: list[str]) -> list[dict]:
 
     for t in tickers:
         try:
-            df  = raw[t].copy() if is_multi else raw.copy()
+            # תיקון #5: טיפול נכון ב-batch עם טיקר בודד
+            if is_multi:
+                if t not in raw.columns.get_level_values(0):
+                    continue
+                df = raw[t].copy()
+            else:
+                df = raw.copy()
+
             res = calc_score(t, df)
             if res:
                 results.append(res)
@@ -149,15 +192,16 @@ def analyze_batch(tickers: list[str]) -> list[dict]:
 
 
 # ─── ממשק ──────────────────────────────────────────────────────────────────
-top_n_ui = st.slider("כמה מניות לבחור (Top N)", 3, 5, 3)
+top_n_ui = st.slider("כמה מניות לבחור (Top N)", 3, 10, 5, key="momentum_top_n")
 
 st.info(
-    "💡 סורק לפי ציון משוקלל: ROC 6M × 0.5 + ROC 12M × 0.3 + ROC 3M × 0.2 + בונוס ווליום\n\n"
-    "🗓️ הרץ בסוף כל רבעון: מרץ | יוני | ספטמבר | דצמבר — אחרי 16:00 שעון ניו יורק"
+    "💡 ציון משוקלל: ROC 6M × 0.5 + ROC 12M × 0.3 + ROC 3M × 0.2 + בונוס ווליום\n\n"
+    "🗓️ הרץ בסוף כל רבעון: מרץ | יוני | ספטמבר | דצמבר — אחרי 16:00 שעון ניו יורק\n\n"
+    "✅ **v2:** סף ROC מינימום | בדיקת גיל מניה | RSI 45–75 | קרבה לשיא | תיקון batch"
 )
 st.divider()
 
-if st.button("🔍 סרוק עכשיו", type="primary"):
+if st.button("🔍 סרוק עכשיו", type="primary", key="momentum_scan_btn"):
 
     get_tickers.clear()
     tickers       = get_tickers()
@@ -184,7 +228,7 @@ if st.button("🔍 סרוק עכשיו", type="primary"):
     status.empty()
 
     if not all_results:
-        st.warning("לא נמצאו מניות. השוק אולי חלש.")
+        st.warning("לא נמצאו מניות. השוק אולי חלש — נסה להוריד את סף ה-ROC.")
         st.stop()
 
     df_all = (
@@ -206,8 +250,9 @@ if st.button("🔍 סרוק עכשיו", type="primary"):
     st.dataframe(df_top, use_container_width=True)
 
     with st.expander(f"📋 כל {len(df_all)} המניות שעברו סף"):
-        df_all.index += 1
-        st.dataframe(df_all, use_container_width=True)
+        df_show = df_all.copy()
+        df_show.index += 1
+        st.dataframe(df_show, use_container_width=True)
 
     csv = df_top.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
@@ -215,4 +260,5 @@ if st.button("🔍 סרוק עכשיו", type="primary"):
         csv,
         f"momentum_top{top_n_ui}_{datetime.now().strftime('%Y%m%d')}.csv",
         "text/csv",
+        key="momentum_download",
     )
