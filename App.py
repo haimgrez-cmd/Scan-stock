@@ -1,13 +1,9 @@
 """
 סורק מומנטום רבעוני — S&P 500
-v3 — כל התיקונים:
-  1. סף מינימום ROC
-  2. בדיקת גיל מניה לפני dropna (מונע SNDK ודומות)
-  3. RSI גבול תחתון + עליון (45–75)
-  4. קרבה לשיא 52 שבועות (80%)
-  5. תיקון באג batch טיקר בודד
-  6. קיצוץ ROC outliers לפני ציון
-  7. סינון סקטורים: Real Estate / Utilities / Consumer Staples
+v4:
+  - סינון סקטורים מחוזק (תומך בשמות עמודה שונים ב-Wikipedia)
+  - דחיית ROC12 > 250% (נתוני זבל — ספין-אופים, מיזוגים)
+  - כל תיקוני v3 נשמרו
 """
 
 import time
@@ -30,53 +26,92 @@ BATCH_SIZE  = 50
 SLEEP       = 1.0
 MIN_DAYS    = 280
 
-# סקטורים שמוחרגים מהסריקה — הגנה, תשתית, נדל"ן
 EXCLUDE_SECTORS = {
-    "Real Estate",       # REITs — DOC, AMT, PLD וכו'
-    "Utilities",         # חברות תשתית — NEE, SO וכו'
-    "Consumer Staples",  # הגנה — KO, PG, WMT וכו'
+    "Real Estate", "Utilities", "Consumer Staples",
+    # וריאנטים נוספים שמופיעים לפעמים ב-Wikipedia
+    "real estate", "utilities", "consumer staples",
+}
+
+# טיקרים ידועים שצריך להוציא ידנית (REITs/Utilities שעלולים לחמוק)
+EXCLUDE_TICKERS = {
+    # REITs
+    "AMT","PLD","EQIX","CCI","SPG","O","WELL","DLR","PSA","EQR",
+    "AVB","VTR","DOC","KIM","REG","MAA","UDR","CPT","NNN","WPC",
+    "INVH","ESS","BXP","ARE","HST","PEAK","IRM","SBA","SBAC",
+    # Utilities
+    "NEE","DUK","SO","D","AEP","EXC","XEL","SRE","PCG","ED",
+    "WEC","ES","ETR","FE","CNP","NI","AES","LNT","PNW","NRG",
+    # Consumer Staples נבחרים (איטיים מדי למומנטום)
+    "KO","PEP","PG","CL","KMB","MKC","SJM","HRL","CPB","CAG",
+    "GIS","K","MO","PM","BTI","TSN","HSY","MDLZ",
 }
 
 
-# ─── טיקרים + סינון סקטור ────────────────────────────────────────────────
+# ─── טיקרים ──────────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400)
-def get_tickers() -> list[str]:
-    # תיקון #7: שולף גם עמודת GICS Sector ומסנן לפני הסריקה
+def get_tickers() -> tuple[list[str], int, int]:
+    """
+    מחזיר (רשימת טיקרים, סה"כ לפני סינון, סה"כ אחרי סינון).
+    מנסה שמות עמודות שונים לסקטור ב-Wikipedia.
+    """
+    SECTOR_COL_CANDIDATES = [
+        "GICS Sector", "GICS sector", "Sector", "sector",
+        "GICS Sub-Industry",
+    ]
+
     try:
         df = pd.read_html(
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
         )[0]
         df["Symbol"] = df["Symbol"].str.replace(".", "-", regex=False)
         before = len(df)
-        df = df[~df["GICS Sector"].isin(EXCLUDE_SECTORS)]
-        after  = len(df)
-        logger.info(f"סקטורים סוננו: {before - after} מניות הוסרו")
+
+        # מצא את עמודת הסקטור
+        sector_col = None
+        for col in SECTOR_COL_CANDIDATES:
+            if col in df.columns:
+                sector_col = col
+                break
+
+        if sector_col:
+            df = df[~df[sector_col].isin(EXCLUDE_SECTORS)]
+
+        # הוצא גם לפי רשימה ידנית
+        df = df[~df["Symbol"].isin(EXCLUDE_TICKERS)]
+        after = len(df)
+
         t = df["Symbol"].tolist()
         if len(t) > 100:
-            return t
-    except Exception:
-        pass
+            return t, before, after
+    except Exception as e:
+        logger.warning(f"Wikipedia fetch failed: {e}")
+
     try:
         url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
         df  = pd.read_csv(url)
         df["Symbol"] = df["Symbol"].str.replace(".", "-", regex=False)
+        before = len(df)
         if "Sector" in df.columns:
             df = df[~df["Sector"].isin(EXCLUDE_SECTORS)]
+        df = df[~df["Symbol"].isin(EXCLUDE_TICKERS)]
+        after = len(df)
         t = df["Symbol"].tolist()
         if len(t) > 100:
-            return t
+            return t, before, after
     except Exception:
         pass
-    # fallback — ללא סקטורים בעייתיים
-    return [
+
+    # fallback — רשימה ידנית נקייה
+    fallback = [
         "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","JPM","V","XOM",
         "MRK","ABBV","BAC","AVGO","LLY","TMO","CSCO","MCD","ACN","ABT",
         "DHR","TXN","UNH","CRM","QCOM","HON","AMD","GE","CAT","GS",
-        "MS","BLK","AXP","ISRG","CVX","MA","HD",
+        "MS","BLK","AXP","ISRG","CVX","MA","HD","SPGI","MMC","ICE",
     ]
+    return fallback, len(fallback), len(fallback)
 
 
-# ─── RSI ──────────────────────────────────────────────────────────────────
+# ─── RSI ─────────────────────────────────────────────────────────────────
 def calc_rsi(s: pd.Series, n: int = 14) -> float:
     d  = s.diff().dropna()
     if len(d) < n:
@@ -87,10 +122,9 @@ def calc_rsi(s: pd.Series, n: int = 14) -> float:
     return 100.0 if ll == 0 else float(100 - 100 / (1 + g.iloc[-1] / ll))
 
 
-# ─── ציון משוקלל ──────────────────────────────────────────────────────────
+# ─── ציון משוקלל ─────────────────────────────────────────────────────────
 def calc_score(ticker: str, df_raw: pd.DataFrame) -> dict | None:
     try:
-        # תיקון #2: בדוק גיל לפני dropna
         if len(df_raw) < MIN_DAYS:
             return None
 
@@ -114,13 +148,11 @@ def calc_score(ticker: str, df_raw: pd.DataFrame) -> dict | None:
         if any(np.isnan(x) for x in [sma50, sma100, sma200]):
             return None
 
-        # מגמה עולה
         if not (sma50 > sma100 > sma200):
             return None
         if last < sma200:
             return None
 
-        # תיקון #4: קרבה לשיא 52 שבועות
         high_52w = float(c.rolling(252).max().iloc[-1])
         if last < high_52w * 0.80:
             return None
@@ -132,14 +164,16 @@ def calc_score(ticker: str, df_raw: pd.DataFrame) -> dict | None:
         if any(np.isnan(x) for x in [roc3, roc6, roc12]):
             return None
 
-        # תיקון #1: סף מינימום ROC
+        # תיקון v4: דחה נתוני זבל — ספין-אופים / מיזוגים / שגיאות yfinance
+        if roc12 > 250 or roc6 > 200 or roc3 > 150:
+            return None
+
+        # סף מינימום
         if roc3  < 3:  return None
         if roc6  < 8:  return None
         if roc12 < 15: return None
 
         rsi = calc_rsi(c)
-
-        # תיקון #3: RSI בין 45 ל-75
         if rsi < 45 or rsi > 75:
             return None
 
@@ -147,10 +181,9 @@ def calc_score(ticker: str, df_raw: pd.DataFrame) -> dict | None:
         vol50     = float(v.iloc[-50:].mean())
         vol_bonus = 5.0 if (vol50 > 0 and vol20 > vol50 * 1.2) else 0.0
 
-        # תיקון #6: חסום outliers לפני ציון
-        roc3_c  = float(np.clip(roc3,  -100, 100))
-        roc6_c  = float(np.clip(roc6,  -100, 150))
-        roc12_c = float(np.clip(roc12, -100, 200))
+        roc3_c  = float(np.clip(roc3,  0, 100))
+        roc6_c  = float(np.clip(roc6,  0, 150))
+        roc12_c = float(np.clip(roc12, 0, 200))
 
         score = (roc6_c * 0.5) + (roc12_c * 0.3) + (roc3_c * 0.2) + vol_bonus
 
@@ -175,7 +208,7 @@ def calc_score(ticker: str, df_raw: pd.DataFrame) -> dict | None:
         return None
 
 
-# ─── batch ────────────────────────────────────────────────────────────────
+# ─── batch ───────────────────────────────────────────────────────────────
 def analyze_batch(tickers: list[str]) -> list[dict]:
     if not tickers:
         return []
@@ -194,7 +227,6 @@ def analyze_batch(tickers: list[str]) -> list[dict]:
 
     for t in tickers:
         try:
-            # תיקון #5: batch טיקר בודד
             if is_multi:
                 if t not in raw.columns.get_level_values(0):
                     continue
@@ -211,24 +243,25 @@ def analyze_batch(tickers: list[str]) -> list[dict]:
     return results
 
 
-# ─── ממשק ─────────────────────────────────────────────────────────────────
+# ─── ממשק ────────────────────────────────────────────────────────────────
 top_n_ui = st.slider("כמה מניות לבחור (Top N)", 3, 10, 5, key="momentum_top_n")
 
-with st.expander("ℹ️ פרטי הסורק"):
+with st.expander("ℹ️ פרטי הסורק v4"):
     st.markdown("""
-**ציון משוקלל:** ROC 6M × 0.5 + ROC 12M × 0.3 + ROC 3M × 0.2 + בונוס ווליום
+**ציון:** ROC 6M × 0.5 + ROC 12M × 0.3 + ROC 3M × 0.2 + בונוס ווליום
 
-**תנאי סף:**
-- SMA50 > SMA100 > SMA200 (מגמה עולה ברורה)
-- מחיר > SMA200
+**סינונים טכניים:**
+- SMA50 > SMA100 > SMA200 | מחיר > SMA200
 - מחיר ≥ 80% מהשיא השנתי
 - ROC 3M ≥ 3% | ROC 6M ≥ 8% | ROC 12M ≥ 15%
-- RSI בין 45 ל-75
-- ווליום ממוצע > 500K
+- ROC 12M ≤ 250% (מעל זה = נתוני זבל)
+- RSI בין 45–75 | ווליום > 500K
 
-**סקטורים מוחרגים:** Real Estate · Utilities · Consumer Staples
+**סקטורים מוחרגים (שתי שכבות):**
+- סינון לפי עמודת GICS Sector מ-Wikipedia
+- רשימה ידנית: כל ה-REITs הידועים + Utilities + Staples איטיים
 
-🗓️ הרץ בסוף כל רבעון: מרץ | יוני | ספטמבר | דצמבר — אחרי 16:00 NY
+🗓️ הרץ: מרץ | יוני | ספטמבר | דצמבר — אחרי 16:00 NY
     """)
 
 st.divider()
@@ -236,10 +269,14 @@ st.divider()
 if st.button("🔍 סרוק עכשיו", type="primary", key="momentum_scan_btn"):
 
     get_tickers.clear()
-    tickers       = get_tickers()
+    tickers, before, after = get_tickers()
     total_tickers = len(tickers)
 
-    st.info(f"סורק {total_tickers} מניות (לאחר סינון סקטורים)...")
+    removed = before - after
+    st.info(
+        f"סורק **{total_tickers}** מניות "
+        f"(סוננו {removed} מניות מסקטורים לא רלוונטיים מתוך {before})"
+    )
 
     bar           = st.progress(0)
     status        = st.empty()
@@ -262,7 +299,7 @@ if st.button("🔍 סרוק עכשיו", type="primary", key="momentum_scan_btn"
     status.empty()
 
     if not all_results:
-        st.warning("לא נמצאו מניות. השוק אולי חלש — נסה להוריד את סף ה-ROC.")
+        st.warning("לא נמצאו מניות. השוק אולי חלש.")
         st.stop()
 
     df_all = (
@@ -275,9 +312,7 @@ if st.button("🔍 סרוק עכשיו", type="primary", key="momentum_scan_btn"
     df_top.index += 1
 
     st.success(
-        f"✅ נסרקו {total_tickers} מניות | "
-        f"עברו סף: {len(df_all)} | "
-        f"מוצגות Top {top_n_ui}"
+        f"✅ נסרקו {total_tickers} | עברו סף: {len(df_all)} | Top {top_n_ui}"
     )
 
     st.subheader(f"🏆 Top {top_n_ui} — המניות לקנות הרבעון הזה")
