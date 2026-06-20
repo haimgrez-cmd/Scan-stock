@@ -1,9 +1,13 @@
 """
 סורק מומנטום רבעוני — S&P 500
-v4:
-  - סינון סקטורים מחוזק (תומך בשמות עמודה שונים ב-Wikipedia)
-  - דחיית ROC12 > 250% (נתוני זבל — ספין-אופים, מיזוגים)
-  - כל תיקוני v3 נשמרו
+v5:
+  - תיעוד מתוקן: כל שלוש תקרות ה-ROC לדחיית "נתוני זבל" מוצגות במפורש
+  - זיהוי סקטור מוקשח: רק עמודות ברמת "Sector" (לא Sub-Industry, ששמות
+    הערכים שלה לא תואמים ל-EXCLUDE_SECTORS וגרמו לכשל שקט)
+  - אזהרה גלויה למשתמש אם סינון הסקטורים לא הצליח להתאים אף ערך
+  - רשימת ה-fallback הקשיחה עוברת כעת גם היא דרך EXCLUDE_TICKERS
+  - ניקוי: הוסרה כפילות בחישוב ממוצע ווליום (vol20 == avg_vol)
+  - כל תיקוני v3/v4 נשמרו
 """
 
 import time
@@ -26,11 +30,22 @@ BATCH_SIZE  = 50
 SLEEP       = 1.0
 MIN_DAYS    = 280
 
+# הערה: זהו סינון ברמת המגזר השלם (GICS Sector) — כל חברות ה-Consumer
+# Staples מוחרגות, לא רק אלה ברשימה הידנית למטה. אם הכוונה הייתה להחריג
+# רק "Staples איטיים" נבחרים ולא את כל המגזר — יש להוציא "Consumer Staples"
+# מהסט הזה ולהסתמך רק על EXCLUDE_TICKERS. כרגע נשמר המצב הקיים (סינון
+# מגזר שלם) כי זה מה שהקוד המקורי עשה בפועל.
 EXCLUDE_SECTORS = {
     "Real Estate", "Utilities", "Consumer Staples",
-    # וריאנטים נוספים שמופיעים לפעמים ב-Wikipedia
     "real estate", "utilities", "consumer staples",
 }
+
+# רק עמודות ברמת "Sector" — לא "GICS Sub-Industry". עמודת תת-התעשייה
+# מכילה ערכים כמו "Diversified REITs" או "Electric Utilities" שלא
+# תואמים בדיוק לאף מחרוזת ב-EXCLUDE_SECTORS, ולכן סינון לפיה נכשל
+# בשקט (false negative על כל הקבוצה). עדיף לא לסנן בכלל ולהזהיר
+# מאשר לסנן לפי עמודה לא נכונה ולחשוב שהסינון עבד.
+SECTOR_COL_CANDIDATES = ["GICS Sector", "GICS sector", "Sector", "sector"]
 
 # טיקרים ידועים שצריך להוציא ידנית (REITs/Utilities שעלולים לחמוק)
 EXCLUDE_TICKERS = {
@@ -49,16 +64,10 @@ EXCLUDE_TICKERS = {
 
 # ─── טיקרים ──────────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400)
-def get_tickers() -> tuple[list[str], int, int]:
+def get_tickers() -> tuple[list[str], int, int, str | None]:
     """
-    מחזיר (רשימת טיקרים, סה"כ לפני סינון, סה"כ אחרי סינון).
-    מנסה שמות עמודות שונים לסקטור ב-Wikipedia.
+    מחזיר (רשימת טיקרים, סה"כ לפני סינון, סה"כ אחרי סינון, אזהרה אם יש).
     """
-    SECTOR_COL_CANDIDATES = [
-        "GICS Sector", "GICS sector", "Sector", "sector",
-        "GICS Sub-Industry",
-    ]
-
     try:
         df = pd.read_html(
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
@@ -66,23 +75,38 @@ def get_tickers() -> tuple[list[str], int, int]:
         df["Symbol"] = df["Symbol"].str.replace(".", "-", regex=False)
         before = len(df)
 
-        # מצא את עמודת הסקטור
         sector_col = None
         for col in SECTOR_COL_CANDIDATES:
             if col in df.columns:
                 sector_col = col
                 break
 
+        warning = None
         if sector_col:
-            df = df[~df[sector_col].isin(EXCLUDE_SECTORS)]
+            removed_by_sector = int(df[sector_col].isin(EXCLUDE_SECTORS).sum())
+            if removed_by_sector == 0:
+                # עמודת סקטור נמצאה, אבל אף ערך לא תאם — כנראה שמות
+                # הסקטורים בוויקיפדיה השתנו. מזהירים במקום לסנן בשקט.
+                warning = (
+                    f"⚠️ עמודת הסקטור '{sector_col}' נמצאה אך אף ערך לא תאם "
+                    f"לרשימת ההחרגה — ייתכן ששמות הסקטורים בוויקיפדיה השתנו. "
+                    f"הסינון מתבסס כרגע רק על הרשימה הידנית של טיקרים."
+                )
+            else:
+                df = df[~df[sector_col].isin(EXCLUDE_SECTORS)]
+        else:
+            warning = (
+                "⚠️ לא נמצאה עמודת סקטור מוכרת בטבלת ויקיפדיה — סינון "
+                "סקטורים (REIT/Utilities/Staples) לא בוצע ברמת המגזר. "
+                "הסינון מתבסס רק על הרשימה הידנית של טיקרים."
+            )
 
-        # הוצא גם לפי רשימה ידנית
         df = df[~df["Symbol"].isin(EXCLUDE_TICKERS)]
         after = len(df)
 
         t = df["Symbol"].tolist()
         if len(t) > 100:
-            return t, before, after
+            return t, before, after, warning
     except Exception as e:
         logger.warning(f"Wikipedia fetch failed: {e}")
 
@@ -91,24 +115,38 @@ def get_tickers() -> tuple[list[str], int, int]:
         df  = pd.read_csv(url)
         df["Symbol"] = df["Symbol"].str.replace(".", "-", regex=False)
         before = len(df)
+        warning = None
         if "Sector" in df.columns:
-            df = df[~df["Sector"].isin(EXCLUDE_SECTORS)]
+            removed_by_sector = int(df["Sector"].isin(EXCLUDE_SECTORS).sum())
+            if removed_by_sector == 0:
+                warning = (
+                    "⚠️ מקור הנתונים החלופי (GitHub) לא תאם אף ערך בעמודת "
+                    "הסקטור — הסינון מתבסס רק על הרשימה הידנית."
+                )
+            else:
+                df = df[~df["Sector"].isin(EXCLUDE_SECTORS)]
         df = df[~df["Symbol"].isin(EXCLUDE_TICKERS)]
         after = len(df)
         t = df["Symbol"].tolist()
         if len(t) > 100:
-            return t, before, after
+            return t, before, after, warning
     except Exception:
         pass
 
-    # fallback — רשימה ידנית נקייה
-    fallback = [
+    # fallback — רשימה ידנית נקייה, מסוננת גם היא דרך EXCLUDE_TICKERS
+    # כדי שעדכונים עתידיים לרשימה לא יחמיקו REIT/Utility בטעות
+    fallback_raw = [
         "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","JPM","V","XOM",
         "MRK","ABBV","BAC","AVGO","LLY","TMO","CSCO","MCD","ACN","ABT",
         "DHR","TXN","UNH","CRM","QCOM","HON","AMD","GE","CAT","GS",
         "MS","BLK","AXP","ISRG","CVX","MA","HD","SPGI","MMC","ICE",
     ]
-    return fallback, len(fallback), len(fallback)
+    fallback = [t for t in fallback_raw if t not in EXCLUDE_TICKERS]
+    warning = (
+        "⚠️ לא ניתן היה למשוך את רשימת ה-S&P 500 לא מוויקיפדיה ולא מ-GitHub — "
+        "נעשה שימוש ברשימת fallback קבועה וקטנה בהרבה (~40 מניות בלבד)."
+    )
+    return fallback, len(fallback_raw), len(fallback), warning
 
 
 # ─── RSI ─────────────────────────────────────────────────────────────────
@@ -136,7 +174,7 @@ def calc_score(ticker: str, df_raw: pd.DataFrame) -> dict | None:
         v = df["Volume"].astype(float)
 
         last    = c.iloc[-1]
-        avg_vol = v.tail(20).mean()
+        avg_vol = v.tail(20).mean()  # ADV20 — נעשה שימוש חוזר בו למטה, לא מחושב פעמיים
 
         if last < 5 or avg_vol < 500_000:
             return None
@@ -164,7 +202,9 @@ def calc_score(ticker: str, df_raw: pd.DataFrame) -> dict | None:
         if any(np.isnan(x) for x in [roc3, roc6, roc12]):
             return None
 
-        # תיקון v4: דחה נתוני זבל — ספין-אופים / מיזוגים / שגיאות yfinance
+        # דחיית נתוני זבל — ספין-אופים / מיזוגים / שגיאות yfinance.
+        # שימי לב: שלוש התקרות האלה (לא רק ROC12) מתועדות כעת גם
+        # בתיבת המידע למשתמש למטה, כדי שהתיעוד יתאים למה שבאמת קורה.
         if roc12 > 250 or roc6 > 200 or roc3 > 150:
             return None
 
@@ -177,16 +217,17 @@ def calc_score(ticker: str, df_raw: pd.DataFrame) -> dict | None:
         if rsi < 45 or rsi > 75:
             return None
 
-        vol20     = float(v.iloc[-20:].mean())
         vol50     = float(v.iloc[-50:].mean())
-        vol_bonus = 5.0 if (vol50 > 0 and vol20 > vol50 * 1.2) else 0.0
+        vol_bonus = 5.0 if (vol50 > 0 and avg_vol > vol50 * 1.2) else 0.0
 
         roc3_c  = float(np.clip(roc3,  0, 100))
         roc6_c  = float(np.clip(roc6,  0, 150))
         roc12_c = float(np.clip(roc12, 0, 200))
 
         score = (roc6_c * 0.5) + (roc12_c * 0.3) + (roc3_c * 0.2) + vol_bonus
-
+        # הערה: score<=0 לא יכול לקרות בפועל בנקודה הזו — הסף המינימלי
+        # (roc3≥3, roc6≥8, roc12≥15) כבר מבטיח ציון חיובי. נשאר כרשת
+        # ביטחון זולה אם הספים ישתנו בעתיד.
         if score <= 0:
             return None
 
@@ -246,20 +287,20 @@ def analyze_batch(tickers: list[str]) -> list[dict]:
 # ─── ממשק ────────────────────────────────────────────────────────────────
 top_n_ui = st.slider("כמה מניות לבחור (Top N)", 3, 10, 5, key="momentum_top_n")
 
-with st.expander("ℹ️ פרטי הסורק v4"):
+with st.expander("ℹ️ פרטי הסורק v5"):
     st.markdown("""
-**ציון:** ROC 6M × 0.5 + ROC 12M × 0.3 + ROC 3M × 0.2 + בונוס ווליום
+**ציון:** ROC 6M × 0.5 + ROC 12M × 0.3 + ROC 3M × 0.2 + בונוס ווליום (5 נק' אם ADV20 > ADV50 × 1.2)
 
 **סינונים טכניים:**
 - SMA50 > SMA100 > SMA200 | מחיר > SMA200
 - מחיר ≥ 80% מהשיא השנתי
 - ROC 3M ≥ 3% | ROC 6M ≥ 8% | ROC 12M ≥ 15%
-- ROC 12M ≤ 250% (מעל זה = נתוני זבל)
-- RSI בין 45–75 | ווליום > 500K
+- דחיית נתוני זבל: ROC 3M ≤ 150% | ROC 6M ≤ 200% | ROC 12M ≤ 250%
+- RSI בין 45–75 | ווליום ממוצע (20 יום) > 500K | מחיר ≥ $5
 
 **סקטורים מוחרגים (שתי שכבות):**
-- סינון לפי עמודת GICS Sector מ-Wikipedia
-- רשימה ידנית: כל ה-REITs הידועים + Utilities + Staples איטיים
+- סינון ברמת המגזר השלם (GICS Sector) לפי עמודת ויקיפדיה: Real Estate, Utilities, Consumer Staples
+- רשימה ידנית נוספת: REITs/Utilities/Staples ספציפיים, כגיבוי אם זיהוי העמודה נכשל
 
 🗓️ הרץ: מרץ | יוני | ספטמבר | דצמבר — אחרי 16:00 NY
     """)
@@ -269,13 +310,16 @@ st.divider()
 if st.button("🔍 סרוק עכשיו", type="primary", key="momentum_scan_btn"):
 
     get_tickers.clear()
-    tickers, before, after = get_tickers()
+    tickers, before, after, sector_warning = get_tickers()
     total_tickers = len(tickers)
+
+    if sector_warning:
+        st.warning(sector_warning)
 
     removed = before - after
     st.info(
         f"סורק **{total_tickers}** מניות "
-        f"(סוננו {removed} מניות מסקטורים לא רלוונטיים מתוך {before})"
+        f"(סוננו {removed} מניות מתוך {before}, לפי סקטור ו/או רשימה ידנית)"
     )
 
     bar           = st.progress(0)
