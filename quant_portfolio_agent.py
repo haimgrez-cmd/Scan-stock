@@ -1,0 +1,175 @@
+"""
+quant_portfolio_agent.py
+=========================
+Simons-style quant portfolio agent - uses yfinance, no API key needed.
+"""
+
+import json
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yfinance as yf
+import streamlit as st
+
+PORTFOLIO_FILE = Path("portfolio_state.json")
+
+EXIT_GAP_PCT = -2.0
+TRIM_GAP_PCT = 8.0
+MAX_POSITIONS = 5
+
+DEFAULT_UNIVERSE = [
+    "LAD", "SYBT", "IBCP", "KNSA", "WKC", "MU", "PLTR", "NBIX",
+    "AMZN", "MSFT", "V", "AAPL",
+]
+
+
+@dataclass
+class Holding:
+    ticker: str
+    name: str
+    price: float
+    target: float
+    weight: float
+    entered_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    @property
+    def gap_pct(self) -> float:
+        if self.price == 0:
+            return 0.0
+        return (self.target - self.price) / self.price * 100
+
+    @property
+    def status(self) -> str:
+        if self.gap_pct <= EXIT_GAP_PCT:
+            return "EXIT"
+        if self.gap_pct < TRIM_GAP_PCT:
+            return "TRIM"
+        return "HOLD"
+
+
+@st.cache_data(ttl=3600)
+def fetch_price_and_target(ticker: str):
+    try:
+        info = yf.Ticker(ticker).info
+        price = info.get("currentPrice") or info.get("regularMarketPrice")
+        target = info.get("targetMeanPrice") or info.get("targetMedianPrice")
+        name = info.get("shortName", ticker)
+        if price and target:
+            return price, target, name
+    except Exception:
+        pass
+    return None, None, None
+
+
+def scan_universe(tickers):
+    candidates = []
+    progress = st.progress(0.0, text="Scanning candidates...")
+    for i, t in enumerate(tickers):
+        price, target, name = fetch_price_and_target(t)
+        if price and target:
+            candidates.append(Holding(ticker=t, name=name, price=price, target=target, weight=0.0))
+        progress.progress((i + 1) / len(tickers), text=f"Scanning {t}...")
+    progress.empty()
+    return candidates
+
+
+def load_portfolio():
+    if not PORTFOLIO_FILE.exists():
+        return []
+    raw = json.loads(PORTFOLIO_FILE.read_text(encoding="utf-8"))
+    return [Holding(**h) for h in raw]
+
+
+def save_portfolio(holdings):
+    PORTFOLIO_FILE.write_text(
+        json.dumps([asdict(h) for h in holdings], ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def run_decision_engine(current, candidates):
+    exits = [h for h in current if h.status == "EXIT"]
+    survivors = [h for h in current if h.status != "EXIT"]
+    open_slots = MAX_POSITIONS - len(survivors)
+    current_tickers = {h.ticker for h in current}
+    fresh = [c for c in candidates if c.ticker not in current_tickers and c.status == "HOLD"]
+    fresh.sort(key=lambda h: h.gap_pct, reverse=True)
+    entries = fresh[:max(0, open_slots)]
+    final_count = len(survivors) + len(entries)
+    equal_weight = round(100 / final_count, 1) if final_count else 0.0
+    for h in survivors:
+        h.weight = equal_weight
+    for h in entries:
+        h.weight = equal_weight
+    return {"exits": exits, "entries": entries, "survivors": survivors, "equal_weight": equal_weight}
+
+
+def main():
+    st.set_page_config(page_title="Quant Portfolio Agent", layout="wide")
+    st.markdown(
+        "<style>html, body, [class*='css'] { direction: rtl; text-align: right; }</style>",
+        unsafe_allow_html=True,
+    )
+    st.title("Quant Portfolio Agent - Simons Style")
+    st.caption("Scans new candidates and manages existing positions by price-vs-target gap only.")
+
+    current = load_portfolio()
+    if not current:
+        st.info("No existing portfolio. Load a starter portfolio below.")
+        if st.button("Load starter portfolio"):
+            defaults = [
+                Holding("LAD", "Lithia Motors", 372, 396, 25),
+                Holding("SYBT", "Stock Yards Bancorp", 81.5, 77.25, 25),
+                Holding("IBCP", "Independent Bank Corp", 38.5, 39.4, 25),
+                Holding("KNSA", "Kiniksa Pharmaceuticals", 75, 88, 25),
+            ]
+            save_portfolio(defaults)
+            st.rerun()
+        return
+
+    universe = st.multiselect("Scan universe", options=DEFAULT_UNIVERSE, default=DEFAULT_UNIVERSE)
+
+    if st.button("Run scan + update decisions", type="primary"):
+        with st.spinner("Fetching prices and analyst targets..."):
+            for h in current:
+                price, target, name = fetch_price_and_target(h.ticker)
+                if price:
+                    h.price = price
+                if target:
+                    h.target = target
+            candidates = scan_universe(universe)
+
+        plan = run_decision_engine(current, candidates)
+        st.subheader("Action plan")
+
+        if plan["exits"]:
+            st.error("Close position:")
+            for h in plan["exits"]:
+                st.write(f"EXIT {h.ticker} - price {h.price:.2f} vs target {h.target:.2f} ({h.gap_pct:+.1f}%)")
+
+        if plan["entries"]:
+            st.success("Open new position:")
+            for h in plan["entries"]:
+                st.write(f"NEW {h.ticker} ({h.name}) - {h.price:.2f} vs target {h.target:.2f} ({h.gap_pct:+.1f}%)")
+
+        if not plan["exits"] and not plan["entries"]:
+            st.info("No change suggested.")
+
+        if st.button("Confirm and update portfolio"):
+            new_portfolio = plan["survivors"] + plan["entries"]
+            save_portfolio(new_portfolio)
+            st.success("Portfolio updated.")
+            st.rerun()
+
+    st.divider()
+    st.subheader("Current portfolio status")
+    for h in current:
+        col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
+        col1.write(f"[{h.status}] {h.ticker}")
+        col2.write(f"Price: {h.price:.2f}")
+        col3.write(f"Target: {h.target:.2f}")
+        col4.write(f"Gap: {h.gap_pct:+.1f}%")
+
+
+if __name__ == "__main__":
+    main()
