@@ -1,26 +1,22 @@
 """
 quant_portfolio_agent.py
 =========================
-Simons-style quant portfolio agent.
+Simons-style quant portfolio agent - uses yfinance, no API key needed.
 """
 
 import json
-import os
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-import requests
+import yfinance as yf
 import streamlit as st
 
-FMP_BASE = "https://financialmodelingprep.com/api/v3"
-FMP_STABLE = "https://financialmodelingprep.com/stable"
 PORTFOLIO_FILE = Path("portfolio_state.json")
 
 EXIT_GAP_PCT = -2.0
 TRIM_GAP_PCT = 8.0
 MAX_POSITIONS = 5
-MAX_WEIGHT_PER_POSITION = 0.20
 
 DEFAULT_UNIVERSE = [
     "LAD", "SYBT", "IBCP", "KNSA", "WKC", "MU", "PLTR", "NBIX",
@@ -52,50 +48,27 @@ class Holding:
         return "HOLD"
 
 
-def _api_key() -> str:
-    key = st.secrets.get("FMP_API_KEY", os.environ.get("FMP_API_KEY", ""))
-    if not key:
-        st.error("Missing FMP_API_KEY in secrets or environment variables.")
-        st.stop()
-    return key
-
-
 @st.cache_data(ttl=3600)
-def fetch_quote(ticker: str):
-    url = f"{FMP_BASE}/quote/{ticker}"
+def fetch_price_and_target(ticker: str):
     try:
-        r = requests.get(url, params={"apikey": _api_key()}, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        return data[0] if data else None
-    except requests.RequestException:
-        return None
-
-
-@st.cache_data(ttl=3600)
-def fetch_price_target(ticker: str):
-    url = f"{FMP_STABLE}/price-target-consensus"
-    try:
-        r = requests.get(url, params={"symbol": ticker, "apikey": _api_key()}, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        if data:
-            return data[0].get("targetConsensus") or data[0].get("targetMedian")
-    except requests.RequestException:
+        info = yf.Ticker(ticker).info
+        price = info.get("currentPrice") or info.get("regularMarketPrice")
+        target = info.get("targetMeanPrice") or info.get("targetMedianPrice")
+        name = info.get("shortName", ticker)
+        if price and target:
+            return price, target, name
+    except Exception:
         pass
-    return None
+    return None, None, None
 
 
 def scan_universe(tickers):
     candidates = []
     progress = st.progress(0.0, text="Scanning candidates...")
     for i, t in enumerate(tickers):
-        quote = fetch_quote(t)
-        target = fetch_price_target(t)
-        if quote and target:
-            candidates.append(
-                Holding(ticker=t, name=quote.get("name", t), price=quote["price"], target=target, weight=0.0)
-            )
+        price, target, name = fetch_price_and_target(t)
+        if price and target:
+            candidates.append(Holding(ticker=t, name=name, price=price, target=target, weight=0.0))
         progress.progress((i + 1) / len(tickers), text=f"Scanning {t}...")
     progress.empty()
     return candidates
@@ -157,14 +130,13 @@ def main():
     universe = st.multiselect("Scan universe", options=DEFAULT_UNIVERSE, default=DEFAULT_UNIVERSE)
 
     if st.button("Run scan + update decisions", type="primary"):
-        with st.spinner("Fetching prices and analyst targets from FMP..."):
+        with st.spinner("Fetching prices and analyst targets..."):
             for h in current:
-                q = fetch_quote(h.ticker)
-                t = fetch_price_target(h.ticker)
-                if q:
-                    h.price = q["price"]
-                if t:
-                    h.target = t
+                price, target, name = fetch_price_and_target(h.ticker)
+                if price:
+                    h.price = price
+                if target:
+                    h.target = target
             candidates = scan_universe(universe)
 
         plan = run_decision_engine(current, candidates)
@@ -192,9 +164,8 @@ def main():
     st.divider()
     st.subheader("Current portfolio status")
     for h in current:
-        label = {"EXIT": "EXIT", "TRIM": "TRIM", "HOLD": "HOLD"}[h.status]
         col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
-        col1.write(f"[{label}] {h.ticker}")
+        col1.write(f"[{h.status}] {h.ticker}")
         col2.write(f"Price: {h.price:.2f}")
         col3.write(f"Target: {h.target:.2f}")
         col4.write(f"Gap: {h.gap_pct:+.1f}%")
