@@ -116,8 +116,13 @@ def scan_universe(tickers: list[str]) -> list[Holding]:
 def load_portfolio() -> list[Holding]:
     if not PORTFOLIO_FILE.exists():
         return []
-    raw = json.loads(PORTFOLIO_FILE.read_text(encoding="utf-8"))
-    return [Holding(**h) for h in raw]
+    try:
+        raw = json.loads(PORTFOLIO_FILE.read_text(encoding="utf-8"))
+        return [Holding(**h) for h in raw]
+    except (TypeError, json.JSONDecodeError):
+        # old/incompatible schema on disk - start fresh instead of crashing
+        PORTFOLIO_FILE.unlink(missing_ok=True)
+        return []
 
 
 def save_portfolio(holdings: list[Holding]) -> None:
