@@ -1,7 +1,7 @@
 """
 quant_portfolio_agent.py
 =========================
-סוכן "סימונס" — סורק מועמדים חדשים + מנהל את תיק ההחזקות הקיים לפי כללים מכניים.
+Simons-style quant portfolio agent.
 """
 
 import json
@@ -55,7 +55,7 @@ class Holding:
 def _api_key() -> str:
     key = st.secrets.get("FMP_API_KEY", os.environ.get("FMP_API_KEY", ""))
     if not key:
-        st.error("חסר FMP_API_KEY ב-secrets או במשתני הסביבה.")
+        st.error("Missing FMP_API_KEY in secrets or environment variables.")
         st.stop()
     return key
 
@@ -88,7 +88,7 @@ def fetch_price_target(ticker: str):
 
 def scan_universe(tickers):
     candidates = []
-    progress = st.progress(0.0, text="סורק מועמדים...")
+    progress = st.progress(0.0, text="Scanning candidates...")
     for i, t in enumerate(tickers):
         quote = fetch_quote(t)
         target = fetch_price_target(t)
@@ -96,7 +96,7 @@ def scan_universe(tickers):
             candidates.append(
                 Holding(ticker=t, name=quote.get("name", t), price=quote["price"], target=target, weight=0.0)
             )
-        progress.progress((i + 1) / len(tickers), text=f"סורק מועמדים... {t}")
+        progress.progress((i + 1) / len(tickers), text=f"Scanning {t}...")
     progress.empty()
     return candidates
 
@@ -132,18 +132,18 @@ def run_decision_engine(current, candidates):
 
 
 def main():
-    st.set_page_config(page_title="סוכן תיק — סימונס", layout="wide")
+    st.set_page_config(page_title="Quant Portfolio Agent", layout="wide")
     st.markdown(
-        """<style>html, body, [class*="css"] { direction: rtl; text-align: right; }</style>""",
+        "<style>html, body, [class*='css'] { direction: rtl; text-align: right; }</style>",
         unsafe_allow_html=True,
     )
-    st.title("🎯 סוכן תיק כמותי — סגנון סימונס")
-    st.caption("סורק מועמדים חדשים ומנהל את הפוזיציות הקיימות לפי פער מחיר-יעד בלבד.")
+    st.title("Quant Portfolio Agent - Simons Style")
+    st.caption("Scans new candidates and manages existing positions by price-vs-target gap only.")
 
     current = load_portfolio()
     if not current:
-        st.info("אין תיק קיים. נטען תיק ברירת מחדל בלחיצת הכפתור.")
-        if st.button("טען תיק התחלתי לדוגמה"):
+        st.info("No existing portfolio. Load a starter portfolio below.")
+        if st.button("Load starter portfolio"):
             defaults = [
                 Holding("LAD", "Lithia Motors", 372, 396, 25),
                 Holding("SYBT", "Stock Yards Bancorp", 81.5, 77.25, 25),
@@ -154,10 +154,10 @@ def main():
             st.rerun()
         return
 
-    universe = st.multiselect("יקום סריקה", options=DEFAULT_UNIVERSE, default=DEFAULT_UNIVERSE)
+    universe = st.multiselect("Scan universe", options=DEFAULT_UNIVERSE, default=DEFAULT_UNIVERSE)
 
-    if st.button("🔍 הרץ סריקה + עדכן החלטות", type="primary"):
-        with st.spinner("מושך מחירים ויעדי אנליסטים מ-FMP..."):
+    if st.button("Run scan + update decisions", type="primary"):
+        with st.spinner("Fetching prices and analyst targets from FMP..."):
             for h in current:
                 q = fetch_quote(h.ticker)
                 t = fetch_price_target(h.ticker)
@@ -168,9 +168,37 @@ def main():
             candidates = scan_universe(universe)
 
         plan = run_decision_engine(current, candidates)
-        st.subheader("📋 תוכנית פעולה")
+        st.subheader("Action plan")
 
         if plan["exits"]:
-            st.error("**לסגור פוזיציה:**")
+            st.error("Close position:")
             for h in plan["exits"]:
-                st.write(f"🔴 {h.ticker} — מחיר {h.price:.2f}$ מול יעד {h.target:.2f}$
+                st.write(f"EXIT {h.ticker} - price {h.price:.2f} vs target {h.target:.2f} ({h.gap_pct:+.1f}%)")
+
+        if plan["entries"]:
+            st.success("Open new position:")
+            for h in plan["entries"]:
+                st.write(f"NEW {h.ticker} ({h.name}) - {h.price:.2f} vs target {h.target:.2f} ({h.gap_pct:+.1f}%)")
+
+        if not plan["exits"] and not plan["entries"]:
+            st.info("No change suggested.")
+
+        if st.button("Confirm and update portfolio"):
+            new_portfolio = plan["survivors"] + plan["entries"]
+            save_portfolio(new_portfolio)
+            st.success("Portfolio updated.")
+            st.rerun()
+
+    st.divider()
+    st.subheader("Current portfolio status")
+    for h in current:
+        label = {"EXIT": "EXIT", "TRIM": "TRIM", "HOLD": "HOLD"}[h.status]
+        col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
+        col1.write(f"[{label}] {h.ticker}")
+        col2.write(f"Price: {h.price:.2f}")
+        col3.write(f"Target: {h.target:.2f}")
+        col4.write(f"Gap: {h.gap_pct:+.1f}%")
+
+
+if __name__ == "__main__":
+    main()
