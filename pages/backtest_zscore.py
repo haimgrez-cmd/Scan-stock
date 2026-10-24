@@ -86,10 +86,37 @@ def load_prices(tickers, years):
     return close.dropna(axis=1, how="all")
 
 
+def fetch_sp500_symbols():
+    """Returns (symbols, source). Tries Wikipedia with a browser User-Agent, then a GitHub CSV."""
+    import io
+    import requests
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
+    try:
+        r = requests.get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+                         headers=headers, timeout=20)
+        r.raise_for_status()
+        df = pd.read_html(io.StringIO(r.text))[0]
+        syms = df["Symbol"].str.replace(".", "-", regex=False).tolist()
+        if len(syms) > 400:
+            return syms, "wikipedia"
+    except Exception:
+        pass
+    try:
+        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+        df = pd.read_csv(url)
+        syms = df["Symbol"].str.replace(".", "-", regex=False).tolist()
+        if len(syms) > 400:
+            return syms, "github"
+    except Exception:
+        pass
+    return [], "failed"
+
 @st.cache_data(ttl=86400)
 def sp500_list(n):
-    df = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-    return tuple(df["Symbol"].str.replace(".", "-", regex=False).tolist()[:n])
+    syms, source = fetch_sp500_symbols()
+    if not syms:
+        raise RuntimeError("Could not download the S&P 500 list from Wikipedia or GitHub.")
+    return tuple(syms[:n])
 
 
 def main():
