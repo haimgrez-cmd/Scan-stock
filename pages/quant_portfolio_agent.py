@@ -47,21 +47,37 @@ class Holding:
         return "HOLD"         # still statistically anomalous
 
 
-@st.cache_data(ttl=86400)
-def get_sp500_universe(n: int) -> list[str]:
+def fetch_sp500_symbols():
+    """Returns (symbols, source). Tries Wikipedia with a browser User-Agent, then a GitHub CSV."""
+    import io
+    import requests
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
     try:
-        df = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-        tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
-        if len(tickers) > 50:
-            return tickers[:n]
-    except Exception as e:
-        logger.warning(f"Wikipedia fetch failed: {e}")
-    # fallback - small manual list
-    fallback = [
-        "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "JPM", "V", "XOM",
-        "MRK", "ABBV", "BAC", "AVGO", "LLY", "TMO", "CSCO", "MCD", "ACN", "ABT",
-    ]
-    return fallback[:n]
+        r = requests.get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+                         headers=headers, timeout=20)
+        r.raise_for_status()
+        df = pd.read_html(io.StringIO(r.text))[0]
+        syms = df["Symbol"].str.replace(".", "-", regex=False).tolist()
+        if len(syms) > 400:
+            return syms, "wikipedia"
+    except Exception:
+        pass
+    try:
+        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+        df = pd.read_csv(url)
+        syms = df["Symbol"].str.replace(".", "-", regex=False).tolist()
+        if len(syms) > 400:
+            return syms, "github"
+    except Exception:
+        pass
+    return [], "failed"
+
+@st.cache_data(ttl=86400)
+def get_sp500_universe(n: int):
+    syms, source = fetch_sp500_symbols()
+    if not syms:
+        return [], "failed"
+    return syms[:n], source
 
 
 def calc_zscore_batch(tickers: list[str]) -> dict[str, tuple[float, float]]:
@@ -167,8 +183,11 @@ def main():
     current = load_portfolio()
 
     universe_n = st.slider("Universe size (S&P 500 slice)", 20, 200, UNIVERSE_SIZE, step=10)
-    universe = get_sp500_universe(universe_n)
-    st.caption(f"Scanning {len(universe)} tickers from the S&P 500.")
+    universe, source = get_sp500_universe(universe_n)
+    if not universe:
+        st.error("Could not download the S&P 500 list. Try again in a few minutes.")
+        st.stop()
+    st.caption(f"Scanning {len(universe)} tickers from the S&P 500 (source: {source}).")
 
     if not current:
         st.info("No existing portfolio yet. Run a scan below to find the first candidates.")
